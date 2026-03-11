@@ -2,6 +2,8 @@ module github.com/vesoft-inc/nebula-http-gateway
 
 go 1.13
 
+replace github.com/lyft/protoc-gen-validate => github.com/envoyproxy/protoc-gen-validate v0.0.13
+
 replace github.com/vesoft-inc/nebula-http-gateway/ccore v0.0.0 => ./ccore
 
 require (
@@ -13,6 +15,7 @@ require (
 
 require (
 	github.com/elazarl/go-bindata-assetfs v1.0.1 // indirect
+	github.com/facebook/fbthrift v0.31.1-0.20211129061412-801ed7f9f295
 	github.com/google/go-cmp v0.5.4 // indirect
 	github.com/prometheus/client_golang v1.9.0 // indirect
 	github.com/shiena/ansicolor v0.0.0-20200904210342-c7312218db18 // indirect

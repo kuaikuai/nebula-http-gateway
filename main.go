@@ -27,7 +27,9 @@ func main() {
 	beego.BConfig.WebConfig.Session.SessionGCMaxLifetime = 60 * 60 * 24
 	beego.BConfig.WebConfig.Session.SessionName = beego.AppConfig.String("sessionkey")
 	beego.BConfig.WebConfig.Session.SessionOn = true
-
+	sessionKey := beego.AppConfig.String("sessionkey")
+	log.Println("Session key:", sessionKey)
+	log.Println("Config loaded:", sessionKey != "")
 	/*
 		logger config
 	*/

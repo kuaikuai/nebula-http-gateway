@@ -6,6 +6,7 @@ import (
 
 	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/logs"
+	"github.com/vesoft-inc/nebula-http-gateway/service/copier"
 	"github.com/vesoft-inc/nebula-http-gateway/service/importer"
 	"github.com/vesoft-inc/nebula-importer/pkg/config"
 
@@ -24,6 +25,11 @@ type ImportRequest struct {
 type ImportActionRequest struct {
 	TaskID     string `json:"taskID"`
 	TaskAction string `json:"taskAction"`
+}
+
+type CopyRequest struct {
+	SrcSpace string `json:"src_space"`
+	DstSpace string `json:"dst_space"`
 }
 
 func (this *TaskController) Import() {
@@ -72,6 +78,49 @@ func (this *TaskController) ImportAction() {
 		res.Data = result
 		res.Message = "Processing a task action successfully"
 	} else {
+		res.Code = -1
+		res.Message = err.Error()
+	}
+	this.Data["json"] = &res
+	this.ServeJSON()
+}
+
+func (this *TaskController) Copy() {
+	var res Response
+	var params CopyRequest
+
+	nsid := this.GetSession(beego.AppConfig.String("sessionkey"))
+	if nsid == nil {
+		res.Code = -1
+		res.Message = "connection refused for lack of session"
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
+	}
+
+	err := json.Unmarshal(this.Ctx.Input.RequestBody, &params)
+	if err != nil {
+		res.Code = -1
+		res.Message = "Invalid request body: " + err.Error()
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
+	}
+
+	if params.SrcSpace == "" || params.DstSpace == "" {
+		res.Code = -1
+		res.Message = "src_space and dst_space are required"
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
+	}
+
+	err = copier.CopySpace(nsid.(string), params.SrcSpace, params.DstSpace)
+	if err == nil {
+		res.Code = 0
+		res.Message = "Copy space successfully"
+	} else {
+		logs.Error(fmt.Sprintf("Failed to copy space: `%s` -> `%s`, error: `%v`", params.SrcSpace, params.DstSpace, err))
 		res.Code = -1
 		res.Message = err.Error()
 	}

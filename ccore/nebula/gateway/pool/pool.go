@@ -369,3 +369,12 @@ func GetClient(nsid string) (*Client, error) {
 
 	return nil, ClientNotExistedError
 }
+
+// GetSessionID returns the session ID for a given nsid
+func GetSessionID(nsid string) (int64, error) {
+	client, err := GetClient(nsid)
+	if err != nil {
+		return 0, err
+	}
+	return client.graphClient.GetSessionID(), nil
+}

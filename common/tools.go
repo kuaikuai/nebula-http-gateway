@@ -6,7 +6,6 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
-	"syscall"
 )
 
 func CreateFileWithPerm(filePath string, permCode string) (*os.File, error) {
@@ -19,8 +18,7 @@ func CreateFileWithPerm(filePath string, permCode string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	mask := syscall.Umask(0)
-	defer syscall.Umask(mask)
+	// Set directory permission directly
 	filedir := path.Dir(filePath)
 	os.MkdirAll(filedir, os.FileMode(perm))
 	fd, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, os.FileMode(perm))

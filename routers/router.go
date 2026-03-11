@@ -13,4 +13,5 @@ func init() {
 
 	beego.Router("/api/task/import", &controllers.TaskController{}, "POST:Import")
 	beego.Router("/api/task/import/action", &controllers.TaskController{}, "POST:ImportAction")
+	beego.Router("/api/task/copy", &controllers.TaskController{}, "POST:Copy")
 }

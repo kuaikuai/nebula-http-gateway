@@ -16,6 +16,7 @@ type (
 		Factory() Factory
 		Version() Version
 		GetTimezoneInfo() types.TimezoneInfo
+		GetSessionID() int64
 	}
 
 	defaultGraphClient defaultClient
@@ -83,6 +84,10 @@ func (c *defaultGraphClient) Factory() Factory {
 
 func (c *defaultGraphClient) Version() Version {
 	return c.defaultClient().Version()
+}
+
+func (c *defaultGraphClient) GetSessionID() int64 {
+	return c.defaultClient().graph.sessionId
 }
 
 func (c *defaultGraphClient) defaultClient() *defaultClient {
