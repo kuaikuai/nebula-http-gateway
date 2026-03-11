@@ -3,6 +3,7 @@ package copier
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/dao"
 )
@@ -15,6 +16,14 @@ func CopySpace(nsid, srcSpace, dstSpace string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create space: %v", err)
 	}
+
+	// Wait for space to be ready (metadata sync)
+	fmt.Println("[INFO] Waiting for space to be ready...")
+	err = waitForSpaceReady(nsid, dstSpace)
+	if err != nil {
+		return fmt.Errorf("space not ready: %v", err)
+	}
+	fmt.Println("[INFO] Space is ready")
 
 	err = createIndexes(nsid, srcSpace, dstSpace)
 	if err != nil {
@@ -44,6 +53,29 @@ func CopySpace(nsid, srcSpace, dstSpace string) error {
 	}
 
 	return nil
+}
+
+// waitForSpaceReady waits for the space to be ready after creation
+func waitForSpaceReady(nsid, spaceName string) error {
+	maxRetries := 30
+	// heartbeat_interval_secs TODO:
+	retryInterval := 20 * time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		time.Sleep(retryInterval)
+		result, _, err := dao.Execute(nsid, "SHOW SPACES", nil)
+		if err != nil {
+			continue
+		}
+		for _, row := range result.Tables {
+			if name, ok := row["Name"].(string); ok {
+				if name == spaceName {
+					return nil // Space is ready
+				}
+			}
+		}
+	}
+	return fmt.Errorf("space %s not ready after %d seconds", spaceName, maxRetries)
 }
 
 func createSpace(nsid, srcSpace, dstSpace string) error {
@@ -185,7 +217,7 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 		var valueParts []string
 		for _, v := range vertices {
 			if vid, ok := v["vid"]; ok {
-				valueParts = append(valueParts, fmt.Sprintf("\"%v\":()", vid))
+				valueParts = append(valueParts, fmt.Sprintf("%s:()", formatVid(vid)))
 			}
 		}
 		if len(valueParts) == 0 {
@@ -193,8 +225,11 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 		}
 		insertGql := fmt.Sprintf("USE %s; INSERT VERTEX %s() VALUES %s",
 			dstSpace, tag, strings.Join(valueParts, ", "))
-		fmt.Println("[DEBUG] INSERT VERTEX (no props):", insertGql)
+		fmt.Printf("[DEBUG] Insert vertex GQL: %s\n", insertGql)
 		_, _, err := dao.Execute(nsid, insertGql, nil)
+		if err != nil {
+			fmt.Printf("[ERROR] Insert vertex failed: %v\n", err)
+		}
 		return err
 	}
 
@@ -204,7 +239,6 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 		if vid == nil {
 			continue
 		}
-		fmt.Printf("[DEBUG] Vertex vid: %v, allKeys: %v\n", vid, allKeys)
 		var values []string
 		for _, k := range allKeys {
 			if val, ok := v[k]; ok {
@@ -213,7 +247,7 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 				values = append(values, "null")
 			}
 		}
-		valueParts = append(valueParts, fmt.Sprintf("\"%v\":(%s)", vid, strings.Join(values, ", ")))
+		valueParts = append(valueParts, fmt.Sprintf("%s:(%s)", formatVid(vid), strings.Join(values, ", ")))
 	}
 
 	if len(valueParts) == 0 {
@@ -223,8 +257,11 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 	propList := strings.Join(allKeys, ", ")
 	insertGql := fmt.Sprintf("USE %s; INSERT VERTEX %s(%s) VALUES %s",
 		dstSpace, tag, propList, strings.Join(valueParts, ", "))
-	fmt.Println("[DEBUG] INSERT VERTEX:", insertGql)
+	fmt.Printf("[DEBUG] Insert vertex GQL: %s\n", insertGql)
 	_, _, err := dao.Execute(nsid, insertGql, nil)
+	if err != nil {
+		fmt.Printf("[ERROR] Insert vertex failed: %v\n", err)
+	}
 	return err
 }
 
@@ -274,14 +311,18 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 			if srcID == nil || dstID == nil {
 				continue
 			}
-			valueParts = append(valueParts, fmt.Sprintf("\"%v\"->\"%v\"", srcID, dstID))
+			valueParts = append(valueParts, fmt.Sprintf("%s->%s", formatVid(srcID), formatVid(dstID)))
 		}
 		if len(valueParts) == 0 {
 			return nil
 		}
 		insertGql := fmt.Sprintf("USE %s; INSERT EDGE %s() VALUES %s",
 			dstSpace, edge, strings.Join(valueParts, ", "))
+		fmt.Printf("[DEBUG] Insert edge GQL: %s\n", insertGql)
 		_, _, err := dao.Execute(nsid, insertGql, nil)
+		if err != nil {
+			fmt.Printf("[ERROR] Insert edge failed: %v\n", err)
+		}
 		return err
 	}
 
@@ -301,7 +342,7 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 				values = append(values, "null")
 			}
 		}
-		valueParts = append(valueParts, fmt.Sprintf("\"%v\"->\"%v\":(%s)", srcID, dstID, strings.Join(values, ", ")))
+		valueParts = append(valueParts, fmt.Sprintf("%s->%s:(%s)", formatVid(srcID), formatVid(dstID), strings.Join(values, ", ")))
 	}
 
 	if len(valueParts) == 0 {
@@ -310,17 +351,37 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 
 	insertGql := fmt.Sprintf("USE %s; INSERT EDGE %s(%s) VALUES %s",
 		dstSpace, edge, propList, strings.Join(valueParts, ", "))
+	fmt.Printf("[DEBUG] Insert edge GQL: %s\n", insertGql)
 	_, _, err := dao.Execute(nsid, insertGql, nil)
+	if err != nil {
+		fmt.Printf("[ERROR] Insert edge failed: %v\n", err)
+	}
 	return err
 }
 
+// formatVid formats the vertex/edge ID for use in INSERT statements
+func formatVid(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return fmt.Sprintf("\"%s\"", escapeString(val))
+	case int, int8, int16, int32, int64:
+		return fmt.Sprintf("%d", val)
+	default:
+		// Fallback: convert to string and quote
+		return fmt.Sprintf("\"%s\"", escapeString(fmt.Sprintf("%v", val)))
+	}
+}
+
+// formatValue formats a property value for use in INSERT statements
 func formatValue(v interface{}) string {
 	switch val := v.(type) {
 	case string:
-		return fmt.Sprintf("\"%s\"", strings.ReplaceAll(val, "\"", "\\\""))
+		return fmt.Sprintf("\"%s\"", escapeString(val))
 	case int, int8, int16, int32, int64:
 		return fmt.Sprintf("%d", val)
-	case float32, float64:
+	case float32:
+		return fmt.Sprintf("%f", val)
+	case float64:
 		return fmt.Sprintf("%f", val)
 	case bool:
 		if val {
@@ -330,4 +391,15 @@ func formatValue(v interface{}) string {
 	default:
 		return "null"
 	}
+}
+
+// escapeString escapes special characters in a string for Nebula Graph INSERT statements
+func escapeString(s string) string {
+	// Order matters: escape backslash first, then quotes
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "\t", "\\t")
+	return s
 }

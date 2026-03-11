@@ -115,15 +115,74 @@ func (this *TaskController) Copy() {
 		return
 	}
 
-	err = copier.CopySpace(nsid.(string), params.SrcSpace, params.DstSpace)
-	if err == nil {
-		res.Code = 0
-		res.Message = "Copy space successfully"
-	} else {
-		logs.Error(fmt.Sprintf("Failed to copy space: `%s` -> `%s`, error: `%v`", params.SrcSpace, params.DstSpace, err))
-		res.Code = -1
-		res.Message = err.Error()
+	// Generate task ID and create task
+	taskID := importer.NewTaskID()
+	task := importer.NewTask(taskID)
+	importer.GetTaskMgr().PutTask(taskID, &task)
+
+	// Start async copy in goroutine
+	go func() {
+		err := copier.CopySpace(nsid.(string), params.SrcSpace, params.DstSpace)
+		if err != nil {
+			logs.Error(fmt.Sprintf("Failed to copy space: `%s` -> `%s`, error: `%v`", params.SrcSpace, params.DstSpace, err))
+			task.TaskStatus = importer.StatusAborted.String()
+			task.TaskMessage = err.Error()
+		} else {
+			task.TaskStatus = importer.StatusFinished.String()
+			importer.GetTaskMgr().DelTask(taskID)
+			logs.Debug(fmt.Sprintf("Success to copy space: `%s` -> `%s`", params.SrcSpace, params.DstSpace))
+		}
+	}()
+
+	// Return immediately with task ID
+	res.Code = 0
+	res.Data = []string{taskID}
+	res.Message = fmt.Sprintf("Copy task %s submit successfully", taskID)
+	this.Data["json"] = &res
+	this.ServeJSON()
+}
+
+func (this *TaskController) CopyAction() {
+	var res Response
+	var params ImportActionRequest
+
+	json.Unmarshal(this.Ctx.Input.RequestBody, &params)
+
+	taskAction := importer.NewTaskAction(params.TaskAction)
+
+	// Handle query action
+	if taskAction == importer.ActionQuery {
+		if t, ok := importer.GetTaskMgr().GetTask(params.TaskID); ok {
+			res.Code = 0
+			res.Data = []importer.Task{*t}
+			res.Message = "Query task successfully"
+		} else {
+			// Task may have finished and been removed from memory
+			res.Code = 0
+			res.Data = []importer.Task{{TaskID: params.TaskID, TaskStatus: importer.StatusFinished.String()}}
+			res.Message = "Task not in memory, may have finished"
+		}
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
 	}
+
+	// Handle stop action
+	if taskAction == importer.ActionStop {
+		if ok := importer.GetTaskMgr().StopTask(params.TaskID); ok {
+			res.Code = 0
+			res.Message = "Task stop successfully"
+		} else {
+			res.Code = -1
+			res.Message = "Task has stopped or finished"
+		}
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
+	}
+
+	res.Code = -1
+	res.Message = "Unknown action"
 	this.Data["json"] = &res
 	this.ServeJSON()
 }

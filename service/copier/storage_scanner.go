@@ -197,7 +197,7 @@ func (s *StorageScanner) getEdgeID(edgeName string) (nebula.EdgeType, error) {
 
 	for _, row := range result.Tables {
 		if opName, ok := row["name"].(string); ok {
-			if opName == "ScanEdges" {
+			if opName == "Traverse" {
 				if opInfo, ok := row["operator info"].(string); ok {
 					fmt.Println("[DEBUG] ScanEdges operator info:", opInfo)
 					if edgeTypeID, found := extractEdgeTypeID(opInfo); found {
@@ -407,7 +407,7 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 		}
 
 		newParts := resp.GetCursors()
-		if newParts == nil || len(newParts) == 0 {
+		if newParts == nil || !hasRemainingCursors(newParts) {
 			if err := flushBatch(); err != nil {
 				return err
 			}
@@ -524,7 +524,7 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 		}
 
 		newParts := resp.GetCursors()
-		if newParts == nil || len(newParts) == 0 {
+		if newParts == nil || !hasRemainingCursors(newParts) {
 			if err := flushBatch(); err != nil {
 				return err
 			}
@@ -580,4 +580,16 @@ func isTimeoutError(err error) bool {
 	return strings.Contains(errStr, "timeout") ||
 		strings.Contains(errStr, "deadline") ||
 		strings.Contains(errStr, "i/o timeout")
+}
+
+func hasRemainingCursors(cursors map[nebula.PartitionID]*storage.ScanCursor) bool {
+	if cursors == nil {
+		return false
+	}
+	for _, cursor := range cursors {
+		if cursor != nil && len(cursor.GetNextCursor()) > 0 {
+			return true
+		}
+	}
+	return false
 }
