@@ -296,7 +296,7 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 	keySet := make(map[string]bool)
 	for _, e := range edges {
 		for k := range e {
-			if !keySet[k] && k != "src" && k != "dst" && k != "rank" && k != "e" && k != "type" {
+			if !keySet[k] && k != "_src" && k != "_dst" && k != "_rank" && k != "_e" && k != "_type" {
 				keySet[k] = true
 				allKeys = append(allKeys, k)
 			}
@@ -306,12 +306,12 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 	if len(allKeys) == 0 {
 		var valueParts []string
 		for _, e := range edges {
-			srcID := e["src"]
-			dstID := e["dst"]
+			srcID := e["_src"]
+			dstID := e["_dst"]
 			if srcID == nil || dstID == nil {
 				continue
 			}
-			valueParts = append(valueParts, fmt.Sprintf("%s->%s", formatVid(srcID), formatVid(dstID)))
+			valueParts = append(valueParts, fmt.Sprintf("%s->%s:()", formatVid(srcID), formatVid(dstID)))
 		}
 		if len(valueParts) == 0 {
 			return nil
@@ -325,12 +325,12 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 		}
 		return err
 	}
-
+	fmt.Printf("[DEBUG] edge allkeys:%v\n", allKeys)
 	propList := strings.Join(allKeys, ", ")
 	var valueParts []string
 	for _, e := range edges {
-		srcID := e["src"]
-		dstID := e["dst"]
+		srcID := e["_src"]
+		dstID := e["_dst"]
 		if srcID == nil || dstID == nil {
 			continue
 		}

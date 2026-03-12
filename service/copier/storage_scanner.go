@@ -420,7 +420,7 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 	if err != nil {
 		return fmt.Errorf("failed to get edge ID: %w", err)
 	}
-	logs.Info("[DEBUG] ScanEdges edgeType: %v", edgeType)
+	logs.Info("[DEBUG] ScanEdges edgeName: %v edgeType: %v", edgeName, edgeType)
 
 	parts := make(map[nebula.PartitionID]*storage.ScanCursor)
 	for _, pid := range s.partIDs {
@@ -445,7 +445,7 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 	}
 
 	returnColumns := []*storage.EdgeProp{
-		{Type: edgeType, Props: nil},
+		{Type: edgeType, Props: [][]byte{[]byte("_src"), []byte("_type"), []byte("_rank"), []byte("_dst")}},
 	}
 
 	for {
@@ -485,29 +485,30 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 			}
 			break
 		}
-
-		columnNames := edgeData.GetColumnNames()
+		// xx._src, xx._type, xx._rank, xx._dst
+		//columnNames := edgeData.GetColumnNames()
+		logs.Info(fmt.Printf("edge column names : %v\n", edgeData.GetColumnNames()))
 		for _, row := range edgeData.GetRows() {
 			values := row.GetValues()
+			//fmt.Printf("edged values: %v", values)
 			if len(values) < 3 {
 				continue
 			}
 
 			srcID := s.valueToString(values[0])
-			dstID := s.valueToString(values[1])
 			var rank int64
 			if values[2] != nil && values[2].IVal != nil {
 				rank = *values[2].IVal
 			}
-
+			dstID := s.valueToString(values[3])
 			propsMap := make(map[string]interface{})
-			propsMap["src"] = srcID
-			propsMap["dst"] = dstID
-			propsMap["rank"] = rank
+			propsMap["_src"] = srcID
+			propsMap["_dst"] = dstID
+			propsMap["_rank"] = rank
 
-			for i := 3; i < len(columnNames)+3 && i < len(values); i++ {
-				propsMap[string(columnNames[i-3])] = s.valueToInterface(values[i])
-			}
+			// for i := 3; i < len(columnNames)+3 && i < len(values); i++ {
+			// 	propsMap[string(columnNames[i-3])] = s.valueToInterface(values[i])
+			// }
 
 			batch = append(batch, propsMap)
 
@@ -519,6 +520,7 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 		}
 
 		newParts := resp.GetCursors()
+		fmt.Printf("[debug] edge newparts : %v\n", newParts)
 		if newParts == nil || !hasRemainingCursors(newParts) {
 			if err := flushBatch(); err != nil {
 				return err
