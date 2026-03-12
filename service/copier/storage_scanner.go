@@ -2,9 +2,12 @@ package copier
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/astaxie/beego/logs"
 
 	"github.com/facebook/fbthrift/thrift/lib/go/thrift"
 	"github.com/vesoft-inc/nebula-go/v3/nebula"
@@ -34,7 +37,7 @@ func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 		return nil, fmt.Errorf("failed to get session ID: %w", err)
 	}
 	scanner.sessionID = sessionID
-	fmt.Println("[DEBUG] SessionID:", sessionID)
+	logs.Info("[DEBUG] SessionID: %v", sessionID)
 
 	addrs, err := scanner.getStorageAddresses()
 	if err != nil {
@@ -50,7 +53,7 @@ func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 		return nil, fmt.Errorf("failed to get space ID: %w", err)
 	}
 	scanner.spaceID = spaceID
-	fmt.Println("[DEBUG] SpaceID:", spaceID)
+	logs.Info("[DEBUG] SpaceID: %v", spaceID)
 
 	partIDs, err := scanner.getPartitionIDs()
 	if err != nil {
@@ -144,13 +147,13 @@ func (s *StorageScanner) getTagID(tagName string) (nebula.TagID, error) {
 		return 0, err
 	}
 
-	fmt.Println("[DEBUG] EXPLAIN result:", result.Tables)
+	logs.Info("[DEBUG] EXPLAIN result: %v", result.Tables)
 
 	for _, row := range result.Tables {
 		if opName, ok := row["name"].(string); ok {
 			if opName == "ScanVertices" {
 				if opInfo, ok := row["operator info"].(string); ok {
-					fmt.Println("[DEBUG] ScanVertices operator info:", opInfo)
+					logs.Info("[DEBUG] ScanVertices operator info: %v", opInfo)
 					if tagID, found := extractTagID(opInfo); found {
 						return nebula.TagID(tagID), nil
 					}
@@ -193,13 +196,13 @@ func (s *StorageScanner) getEdgeID(edgeName string) (nebula.EdgeType, error) {
 		return 0, err
 	}
 
-	fmt.Println("[DEBUG] EXPLAIN result:", result.Tables)
+	logs.Info("[DEBUG] EXPLAIN result: %v", result.Tables)
 
 	for _, row := range result.Tables {
 		if opName, ok := row["name"].(string); ok {
 			if opName == "Traverse" {
 				if opInfo, ok := row["operator info"].(string); ok {
-					fmt.Println("[DEBUG] ScanEdges operator info:", opInfo)
+					logs.Info("[DEBUG] ScanEdges operator info: %v", opInfo)
 					if edgeTypeID, found := extractEdgeTypeID(opInfo); found {
 						return nebula.EdgeType(edgeTypeID), nil
 					}
@@ -212,26 +215,18 @@ func (s *StorageScanner) getEdgeID(edgeName string) (nebula.EdgeType, error) {
 }
 
 func extractEdgeTypeID(opInfo string) (int64, bool) {
-	for i := 0; i < len(opInfo)-7; i++ {
-		if strings.Contains(opInfo[i:i+6], "type") {
-			for j := i; j < len(opInfo); j++ {
-				if opInfo[j] == ':' {
-					j++
-					for j < len(opInfo) && (opInfo[j] == ':' || opInfo[j] == ' ' || opInfo[j] == '"') {
-						j++
-					}
-					var num int64
-					for j < len(opInfo) && opInfo[j] >= '0' && opInfo[j] <= '9' {
-						num = num*10 + int64(opInfo[j]-'0')
-						j++
-					}
-					if num > 0 {
-						return num, true
-					}
-				}
+	re := regexp.MustCompile(`"type":\s*(\d+)`)
+	matches := re.FindAllStringSubmatch(opInfo, -1)
+
+	for _, match := range matches {
+		if len(match) > 1 {
+			num, err := strconv.ParseInt(match[1], 10, 64)
+			if err == nil && num > 0 {
+				return num, true
 			}
 		}
 	}
+
 	return 0, false
 }
 
@@ -270,14 +265,14 @@ func (s *StorageScanner) createStorageClient() (*storage.GraphStorageServiceClie
 }
 
 func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler func([]map[string]interface{}) error) error {
-	fmt.Println("[DEBUG] ScanVertices spaceID:", s.spaceID)
-	fmt.Println("[DEBUG] ScanVertices tagName:", tagName)
+	logs.Info("[DEBUG] ScanVertices spaceID: %v", s.spaceID)
+	logs.Info("[DEBUG] ScanVertices tagName: %v", tagName)
 
 	tagID, err := s.getTagID(tagName)
 	if err != nil {
 		return fmt.Errorf("failed to get tag ID: %w", err)
 	}
-	fmt.Println("[DEBUG] ScanVertices tagID:", tagID)
+	logs.Info("[DEBUG] ScanVertices tagID: %v", tagID)
 
 	parts := make(map[nebula.PartitionID]*storage.ScanCursor)
 	for _, pid := range s.partIDs {
@@ -425,7 +420,7 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 	if err != nil {
 		return fmt.Errorf("failed to get edge ID: %w", err)
 	}
-	fmt.Println("[DEBUG] ScanEdges edgeType:", edgeType)
+	logs.Info("[DEBUG] ScanEdges edgeType: %v", edgeType)
 
 	parts := make(map[nebula.PartitionID]*storage.ScanCursor)
 	for _, pid := range s.partIDs {
