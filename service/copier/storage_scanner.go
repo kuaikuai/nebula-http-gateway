@@ -13,7 +13,7 @@ import (
 	"github.com/vesoft-inc/nebula-go/v3/nebula"
 	"github.com/vesoft-inc/nebula-go/v3/nebula/storage"
 	"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/dao"
-	"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/pool"
+	//"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/pool"
 )
 
 type StorageScanner struct {
@@ -22,63 +22,64 @@ type StorageScanner struct {
 	client      *storage.GraphStorageServiceClient
 	spaceID     nebula.GraphSpaceID
 	spaceName   string
-	partIDs     []nebula.PartitionID
+	partInfo    []PartitionInfo
 	sessionID   int64
+	storageClients map[string]*storage.GraphStorageServiceClient
 }
 
 func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 	scanner := &StorageScanner{
 		nsid:      nsid,
 		spaceName: spaceName,
+		storageClients: make(map[string]*storage.GraphStorageServiceClient,0),
 	}
-
-	sessionID, err := pool.GetSessionID(nsid)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get session ID: %w", err)
-	}
-	scanner.sessionID = sessionID
-	logs.Info("[DEBUG] SessionID: %v", sessionID)
-
-	addrs, err := scanner.getStorageAddresses()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get storage addresses: %w", err)
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("no storage addresses available")
-	}
-	scanner.storageAddr = addrs[0]
-
 	spaceID, err := scanner.getSpaceID(spaceName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get space ID: %w", err)
 	}
 	scanner.spaceID = spaceID
 	logs.Info("[DEBUG] SpaceID: %v", spaceID)
-
-	partIDs, err := scanner.getPartitionIDs()
+	// 获取分区信息（包括 Leader）
+	partInfo, err := scanner.getPartitionInfo()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get partition IDs: %w", err)
+		return nil, fmt.Errorf("failed to get partition info: %w", err)
 	}
-	if len(partIDs) == 0 {
+	if len(partInfo) == 0 {
 		return nil, fmt.Errorf("no partitions found")
 	}
-	scanner.partIDs = partIDs
+	scanner.partInfo = partInfo
 
-	client, err := scanner.createStorageClient()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create storage client: %w", err)
+	// 收集唯一的 Leader 地址
+	uniqueAddrs := make(map[string]bool)
+	for _, p := range partInfo {
+		if p.Leader != "" {
+			uniqueAddrs[p.Leader] = true
+		}
 	}
-	scanner.client = client
+
+	// 为每个唯一地址创建 client
+	for addr := range uniqueAddrs {
+		logs.Info("[DEBUG] Creating storage client for: %s", addr)
+		client, err := createStorageClient(addr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create storage client for %s: %w", addr, err)
+		}
+		scanner.storageClients[addr] = client
+	}
+
 
 	return scanner, nil
 }
 
 func (s *StorageScanner) Close() error {
-	if s.client != nil {
-		return s.client.Close()
+	for _, client := range s.storageClients {
+		if client != nil {
+			client.Close()
+		}
 	}
 	return nil
 }
+
 
 func (s *StorageScanner) getStorageAddresses() ([]string, error) {
 	gql := fmt.Sprintf("USE %s; SHOW HOSTS STORAGE", s.spaceName)
@@ -98,20 +99,34 @@ func (s *StorageScanner) getStorageAddresses() ([]string, error) {
 	return addrs, nil
 }
 
-func (s *StorageScanner) getPartitionIDs() ([]nebula.PartitionID, error) {
+// PartitionInfo holds partition and its leader address
+type PartitionInfo struct {
+	PartID nebula.PartitionID
+	Leader string // host:port
+}
+
+func (s *StorageScanner) getPartitionInfo() ([]PartitionInfo, error) {
 	result, _, err := dao.Execute(s.nsid, fmt.Sprintf("USE %s; SHOW PARTS", s.spaceName), nil)
 	if err != nil {
 		return nil, err
 	}
 
-	var partIDs []nebula.PartitionID
+	var parts []PartitionInfo
 	for _, row := range result.Tables {
 		if partID, ok := row["Partition ID"].(int64); ok {
-			partIDs = append(partIDs, nebula.PartitionID(partID))
+			var leader string
+			if leaderVal, ok := row["Leader"]; ok {
+				leader = fmt.Sprintf("%v", leaderVal)
+			}
+			parts = append(parts, PartitionInfo{
+				PartID: nebula.PartitionID(partID),
+				Leader: leader,
+			})
 		}
 	}
-	return partIDs, nil
+	return parts, nil
 }
+
 
 func (s *StorageScanner) getSpaceID(spaceName string) (nebula.GraphSpaceID, error) {
 	result, _, err := dao.Execute(s.nsid, fmt.Sprintf("DESCRIBE SPACE %s", spaceName), nil)
@@ -230,10 +245,10 @@ func extractEdgeTypeID(opInfo string) (int64, bool) {
 	return 0, false
 }
 
-func (s *StorageScanner) createStorageClient() (*storage.GraphStorageServiceClient, error) {
-	parts := strings.Split(strings.TrimSpace(s.storageAddr), ":")
+func createStorageClient(addr string) (*storage.GraphStorageServiceClient, error) {
+	parts := strings.Split(strings.TrimSpace(addr), ":")
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid storage address: %s", s.storageAddr)
+		return nil, fmt.Errorf("invalid storage address: %s", addr)
 	}
 
 	host := parts[0]
@@ -264,6 +279,12 @@ func (s *StorageScanner) createStorageClient() (*storage.GraphStorageServiceClie
 	return client, nil
 }
 
+type partState struct {
+	cursor   *storage.ScanCursor
+	done     bool
+	leader   string // 新增：该分区对应的 storage 地址
+}
+
 func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler func([]map[string]interface{}) error) error {
 	logs.Info("[DEBUG] ScanVertices spaceID: %v", s.spaceID)
 	logs.Info("[DEBUG] ScanVertices tagName: %v", tagName)
@@ -274,9 +295,10 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 	}
 	logs.Info("[DEBUG] ScanVertices tagID: %v", tagID)
 
-	parts := make(map[nebula.PartitionID]*storage.ScanCursor)
-	for _, pid := range s.partIDs {
-		parts[pid] = nil
+	// 初始化分区状态
+	partStates := make(map[nebula.PartitionID]*partState)
+	for _, p := range s.partInfo {
+		partStates[p.PartID] = &partState{leader: p.Leader}
 	}
 
 	batch := make([]map[string]interface{}, 0, batchSize)
@@ -301,114 +323,132 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 	}
 
 	for {
-		req := &storage.ScanVertexRequest{
-			SpaceID:                s.spaceID,
-			Parts:                  parts,
-			ReturnColumns:          returnColumns,
-			Limit:                  int64(batchSize),
-			OnlyLatestVersion:      true,
-			EnableReadFromFollower: true,
-			Common:                 common,
-		}
+		hasData := false
 
-		resp, err := s.client.ScanVertex(req)
-		if err != nil {
-			if isTimeoutError(err) && len(batch) > 0 {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			return fmt.Errorf("scan vertex failed: %w", err)
-		}
-
-		failedParts := resp.GetResult_().GetFailedParts()
-		for _, part := range failedParts {
-			if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
-				continue
-			}
-			if part.GetCode() != nebula.ErrorCode_SUCCEEDED {
-				return fmt.Errorf("scan failed on partition %d: error code %d", part.GetPartID(), part.GetCode())
-			}
-		}
-
-		vertexData := resp.GetProps()
-		if vertexData == nil || len(vertexData.GetRows()) == 0 {
-			if err := flushBatch(); err != nil {
-				return err
-			}
-			break
-		}
-
-		columnNames := vertexData.GetColumnNames()
-		fmt.Printf("[DEBUG] ScanVertices columnNames: %v\n", columnNames)
-
-		for _, row := range vertexData.GetRows() {
-			values := row.GetValues()
-			fmt.Printf("[DEBUG] ScanVertices first row values: %v\n", values)
-			if len(values) == 0 {
+		// 逐分区扫描
+		for pid, state := range partStates {
+			if state.done {
 				continue
 			}
 
-			// Determine if _vid is in columnNames
-			vidColumnIndex := -1
-			for i, colName := range columnNames {
-				if strings.ToLower(string(colName)) == "_vid" || strings.ToLower(string(colName)) == "vid" {
-					vidColumnIndex = i
-					break
-				}
+			// 获取该分区对应的 client
+			client, ok := s.storageClients[state.leader]
+			if !ok {
+				logs.Error("no client for leader: %s", state.leader)
+				continue
 			}
 
-			var vid string
-			if vidColumnIndex >= 0 {
-				// _vid is in columnNames, extract from that position
-				vid = s.valueToString(values[vidColumnIndex])
-			} else {
-				// _vid is not in columnNames, assume first value is vid
-				vid = s.valueToString(values[0])
-			}
-			fmt.Printf("[DEBUG] Extracted vid: '%s' (column index: %d)\n", vid, vidColumnIndex)
-			if vidColumnIndex >= 0 {
-				// _vid is in columnNames, extract from that position
-				vid = s.valueToString(values[vidColumnIndex])
-			} else {
-				// _vid is not in columnNames, assume first value is vid
-				vid = s.valueToString(values[0])
+			// 构建单分区请求
+			reqParts := map[nebula.PartitionID]*storage.ScanCursor{pid: state.cursor}
+
+			req := &storage.ScanVertexRequest{
+				SpaceID:                s.spaceID,
+				Parts:                  reqParts,
+				ReturnColumns:          returnColumns,
+				Limit:                  int64(batchSize),
+				OnlyLatestVersion:      true,
+				EnableReadFromFollower: true,
+				Common:                 common,
 			}
 
-			propsMap := make(map[string]interface{})
-			propsMap["vid"] = vid
-
-			// Add properties, skipping _vid/vid column
-			for i, colName := range columnNames {
-				colStr := strings.ToLower(string(colName))
-				if colStr == "_vid" || colStr == "vid" {
+			resp, err := client.ScanVertex(req)
+			if err != nil {
+				if isTimeoutError(err) && len(batch) > 0 {
+					time.Sleep(100 * time.Millisecond)
 					continue
 				}
-				// Strip tag prefix if present (e.g., "genre.name" -> "name")
-				propName := colStr
-				if idx := strings.Index(colStr, "."); idx > 0 {
-					propName = colStr[idx+1:]
+				logs.Error("scan vertex failed for partition %d: %v", pid, err)
+				continue
+			}
+
+			failedParts := resp.GetResult_().GetFailedParts()
+			for _, part := range failedParts {
+				if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
+					continue
 				}
-				if i < len(values) {
-					propsMap[propName] = s.valueToInterface(values[i])
+				if part.GetCode() != nebula.ErrorCode_SUCCEEDED {
+					logs.Error("scan failed on partition %d: error code %d", part.GetPartID(), part.GetCode())
+					continue
 				}
 			}
-			batch = append(batch, propsMap)
 
-			if len(batch) >= batchSize {
-				if err := flushBatch(); err != nil {
-					return err
+			vertexData := resp.GetProps()
+			if vertexData == nil || len(vertexData.GetRows()) == 0 {
+				state.done = true
+				continue
+			}
+
+			hasData = true
+
+			columnNames := vertexData.GetColumnNames()
+			logs.Info("[DEBUG] ScanVertices partition %d columnNames: %v", pid, columnNames)
+
+			for _, row := range vertexData.GetRows() {
+				values := row.GetValues()
+				if len(values) == 0 {
+					continue
 				}
+
+				// Determine if _vid is in columnNames
+				vidColumnIndex := -1
+				for i, colName := range columnNames {
+					if strings.ToLower(string(colName)) == "_vid" || strings.ToLower(string(colName)) == "vid" {
+						vidColumnIndex = i
+						break
+					}
+				}
+
+				var vid string
+				if vidColumnIndex >= 0 {
+					vid = s.valueToString(values[vidColumnIndex])
+				} else {
+					vid = s.valueToString(values[0])
+				}
+
+				propsMap := make(map[string]interface{})
+				propsMap["vid"] = vid
+
+				// Add properties, skipping _vid/vid column
+				for i, colName := range columnNames {
+					colStr := strings.ToLower(string(colName))
+					if colStr == "_vid" || colStr == "vid" {
+						continue
+					}
+					// Strip tag prefix if present (e.g., "genre.name" -> "name")
+					propName := colStr
+					if idx := strings.Index(colStr, "."); idx > 0 {
+						propName = colStr[idx+1:]
+					}
+					if i < len(values) {
+						propsMap[propName] = s.valueToInterface(values[i])
+					}
+				}
+				batch = append(batch, propsMap)
+
+				if len(batch) >= batchSize {
+					if err := flushBatch(); err != nil {
+						return err
+					}
+				}
+			}
+
+			// 更新分区状态
+			cursors := resp.GetCursors()
+			if cursor, ok := cursors[pid]; ok && len(cursor.GetNextCursor()) > 0 {
+				state.cursor = cursor
+			} else {
+				state.done = true
 			}
 		}
 
-		newParts := resp.GetCursors()
-		if newParts == nil || !hasRemainingCursors(newParts) {
+		// 检查是否全部完成
+		if !hasData || allPartsDone(partStates) {
 			if err := flushBatch(); err != nil {
 				return err
 			}
 			break
 		}
-		parts = newParts
+
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -422,9 +462,10 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 	}
 	logs.Info("[DEBUG] ScanEdges edgeName: %v edgeType: %v", edgeName, edgeType)
 
-	parts := make(map[nebula.PartitionID]*storage.ScanCursor)
-	for _, pid := range s.partIDs {
-		parts[pid] = nil
+	// 初始化分区状态
+	partStates := make(map[nebula.PartitionID]*partState)
+	for _, p := range s.partInfo {
+		partStates[p.PartID] = &partState{leader: p.Leader}
 	}
 
 	batch := make([]map[string]interface{}, 0, batchSize)
@@ -449,90 +490,112 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 	}
 
 	for {
-		req := &storage.ScanEdgeRequest{
-			SpaceID:                s.spaceID,
-			Parts:                  parts,
-			ReturnColumns:          returnColumns,
-			Limit:                  int64(batchSize),
-			OnlyLatestVersion:      true,
-			EnableReadFromFollower: true,
-			Common:                 common,
-		}
+		hasData := false
 
-		resp, err := s.client.ScanEdge(req)
-		if err != nil {
-			if isTimeoutError(err) && len(batch) > 0 {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-			return fmt.Errorf("scan edge failed: %w", err)
-		}
-
-		failedParts := resp.GetResult_().GetFailedParts()
-		for _, part := range failedParts {
-			if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
-				continue
-			}
-			if part.GetCode() != nebula.ErrorCode_SUCCEEDED {
-				return fmt.Errorf("scan failed on partition %d: error code %d", part.GetPartID(), part.GetCode())
-			}
-		}
-
-		edgeData := resp.GetProps()
-		if edgeData == nil || len(edgeData.GetRows()) == 0 {
-			if err := flushBatch(); err != nil {
-				return err
-			}
-			break
-		}
-		// xx._src, xx._type, xx._rank, xx._dst
-		//columnNames := edgeData.GetColumnNames()
-		logs.Info(fmt.Printf("edge column names : %v\n", edgeData.GetColumnNames()))
-		for _, row := range edgeData.GetRows() {
-			values := row.GetValues()
-			//fmt.Printf("edged values: %v", values)
-			if len(values) < 3 {
+		// 逐分区扫描
+		for pid, state := range partStates {
+			if state.done {
 				continue
 			}
 
-			srcID := s.valueToString(values[0])
-			var rank int64
-			if values[2] != nil && values[2].IVal != nil {
-				rank = *values[2].IVal
+			// 获取该分区对应的 client
+			client, ok := s.storageClients[state.leader]
+			if !ok {
+				logs.Error("no client for leader: %s", state.leader)
+				continue
 			}
-			dstID := s.valueToString(values[3])
-			propsMap := make(map[string]interface{})
-			propsMap["_src"] = srcID
-			propsMap["_dst"] = dstID
-			propsMap["_rank"] = rank
 
-			// for i := 3; i < len(columnNames)+3 && i < len(values); i++ {
-			// 	propsMap[string(columnNames[i-3])] = s.valueToInterface(values[i])
-			// }
+			// 构建单分区请求
+			reqParts := map[nebula.PartitionID]*storage.ScanCursor{pid: state.cursor}
 
-			batch = append(batch, propsMap)
+			req := &storage.ScanEdgeRequest{
+				SpaceID:                s.spaceID,
+				Parts:                  reqParts,
+				ReturnColumns:          returnColumns,
+				Limit:                  int64(batchSize),
+				OnlyLatestVersion:      true,
+				EnableReadFromFollower: true,
+				Common:                 common,
+			}
 
-			if len(batch) >= batchSize {
-				if err := flushBatch(); err != nil {
-					return err
+			resp, err := client.ScanEdge(req)
+			if err != nil {
+				if isTimeoutError(err) && len(batch) > 0 {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				logs.Error("scan edge failed for partition %d: %v", pid, err)
+				continue
+			}
+
+			failedParts := resp.GetResult_().GetFailedParts()
+			for _, part := range failedParts {
+				if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
+					continue
+				}
+				if part.GetCode() != nebula.ErrorCode_SUCCEEDED {
+					logs.Error("scan failed on partition %d, spaceID %d: rror code %d", part.GetPartID(), s.spaceID, part.GetCode())
+					continue
 				}
 			}
+
+			edgeData := resp.GetProps()
+			if edgeData == nil || len(edgeData.GetRows()) == 0 {
+				state.done = true
+				continue
+			}
+
+			hasData = true
+
+			for _, row := range edgeData.GetRows() {
+				values := row.GetValues()
+				if len(values) < 3 {
+					continue
+				}
+
+				srcID := s.valueToString(values[0])
+				var rank int64
+				if values[2] != nil && values[2].IVal != nil {
+					rank = *values[2].IVal
+				}
+				dstID := s.valueToString(values[3])
+				propsMap := make(map[string]interface{})
+				propsMap["_src"] = srcID
+				propsMap["_dst"] = dstID
+				propsMap["_rank"] = rank
+
+				batch = append(batch, propsMap)
+
+				if len(batch) >= batchSize {
+					if err := flushBatch(); err != nil {
+						return err
+					}
+				}
+			}
+
+			// 更新分区状态
+			cursors := resp.GetCursors()
+			if cursor, ok := cursors[pid]; ok && len(cursor.GetNextCursor()) > 0 {
+				state.cursor = cursor
+			} else {
+				state.done = true
+			}
 		}
 
-		newParts := resp.GetCursors()
-		fmt.Printf("[debug] edge newparts : %v\n", newParts)
-		if newParts == nil || !hasRemainingCursors(newParts) {
+		// 检查是否全部完成
+		if !hasData || allPartsDone(partStates) {
 			if err := flushBatch(); err != nil {
 				return err
 			}
 			break
 		}
-		parts = newParts
+
 		time.Sleep(10 * time.Millisecond)
 	}
 
 	return nil
 }
+
 
 func (s *StorageScanner) valueToString(val *nebula.Value) string {
 	if val == nil {
@@ -589,4 +652,14 @@ func hasRemainingCursors(cursors map[nebula.PartitionID]*storage.ScanCursor) boo
 		}
 	}
 	return false
+}
+
+// allPartsDone 检查所有分区是否完成
+func allPartsDone(partStates map[nebula.PartitionID]*partState) bool {
+	for _, state := range partStates {
+		if !state.done {
+			return false
+		}
+	}
+	return true
 }
