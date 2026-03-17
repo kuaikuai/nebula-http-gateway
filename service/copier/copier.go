@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
+	"github.com/astaxie/beego/logs"
 	"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/dao"
 )
 
@@ -30,7 +30,15 @@ func CopySpace(nsid, srcSpace, dstSpace string) error {
 		return fmt.Errorf("failed to create indexes: %v", err)
 	}
 
-	//TODO: ES indexes are not supported by storage API, so we need to create them before copying data
+	haveListeners, err := copyListeners(nsid, srcSpace, dstSpace)
+	if err != nil {
+		return fmt.Errorf("failed to copy listeners: %w", err)
+	}
+	if haveListeners {
+		if err := copyFulltextIndexes(nsid, srcSpace, dstSpace); err != nil {
+			return fmt.Errorf("failed to copy fulltext indexes: %w", err)
+    }
+	}
 
 	tags, err := getTags(nsid, srcSpace)
 	if err != nil {
@@ -113,6 +121,125 @@ func getEdges(nsid, space string) ([]string, error) {
 	}
 	return edges, nil
 }
+
+func getSpaceID(nsid, spaceName string) (int64, error) {
+	result, _, err := dao.Execute(nsid, fmt.Sprintf("DESCRIBE SPACE %s", spaceName), nil)
+	if err != nil {
+		return 0, err
+	}
+
+	for _, row := range result.Tables {
+		if id, ok := row["ID"].(int64); ok {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("space ID not found for space %s", spaceName)
+}
+
+// copyFulltextIndexes 复制全文本索引到新 space
+func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
+	// 1. 获取 dstSpace 的 ID
+	dstSpaceID, err := getSpaceID(nsid, dstSpace)
+	if err != nil {
+		return fmt.Errorf("failed to get dst space ID: %w", err)
+	}
+
+	// 2. 在原 space 获取全文本索引信息
+	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW FULLTEXT INDEXES", srcSpace), nil)
+	if err != nil {
+		return fmt.Errorf("show fulltext indexes failed: %w", err)
+	}
+
+	if len(result.Tables) == 0 {
+		logs.Info("[DEBUG] No fulltext indexes found in source space")
+		return nil
+	}
+
+	// 3. 解析并创建全文本索引
+	for _, row := range result.Tables {
+		indexName, _ := row["Name"].(string)
+		schemaType, _ := row["Schema Type"].(string)  // Tag 或 Edge
+		schemaName, _ := row["Schema Name"].(string)
+		fields, _ := row["Fields"].(string)
+		analyzer, _ := row["Analyzer"].(string)
+
+		if indexName == "" || schemaName == "" || fields == "" {
+			continue
+		}
+
+		// 在索引名后加上 space ID 避免冲突
+		newIndexName := fmt.Sprintf("%s_%d", indexName, dstSpaceID)
+
+		// 4. 生成 CREATE FULLTEXT INDEX nGQL
+		var createGql string
+		if schemaType == "Tag" {
+			createGql = fmt.Sprintf("CREATE FULLTEXT TAG INDEX %s ON %s(%s) ANALYZER=\"%s\"",
+				newIndexName, schemaName, fields, analyzer)
+		} else if schemaType == "Edge" {
+			createGql = fmt.Sprintf("CREATE FULLTEXT EDGE INDEX %s ON %s(%s) ANALYZER=\"%s\"",
+				newIndexName, schemaName, fields, analyzer)
+		} else {
+			continue
+		}
+
+		fullGql := fmt.Sprintf("USE %s; %s", dstSpace, createGql)
+
+		logs.Info("[DEBUG] Creating fulltext index: %s (original: %s)", newIndexName, indexName)
+
+		_, _, err = dao.Execute(nsid, fullGql, nil)
+		if err != nil {
+			return fmt.Errorf("create fulltext index %s failed: %w", newIndexName, err)
+		}
+	}
+
+	logs.Info("[DEBUG] Fulltext indexes copied successfully")
+	return nil
+}
+
+// copyListeners 复制 LISTENER 配置到新 space
+func copyListeners(nsid, srcSpace, dstSpace string) (bool,error) {
+	// 1. 在原 space 获取 LISTENER 信息
+	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW LISTENER", srcSpace), nil)
+	if err != nil {
+		return false, fmt.Errorf("show listener failed: %w", err)
+	}
+
+	if len(result.Tables) == 0 {
+		logs.Info("[DEBUG] No listeners found in source space")
+		return false, nil
+	}
+
+	// 2. 提取 ELASTICSEARCH 类型的 Host
+	var hosts []string
+	for _, row := range result.Tables {
+		if listenerType, ok := row["Type"].(string); ok && listenerType == "ELASTICSEARCH" {
+			if host, ok := row["Host"].(string); ok {
+				hosts = append(hosts, host)
+			}
+		}
+	}
+
+	if len(hosts) == 0 {
+		logs.Info("No ELASTICSEARCH listeners found")
+		return false, nil
+	}
+
+	// 3. 生成 ADD LISTENER nGQL 并执行
+	hostsStr := strings.Join(hosts, ",")
+	addListenerGql := fmt.Sprintf("ADD LISTENER ELASTICSEARCH %s", hostsStr)
+	fullGql := fmt.Sprintf("USE %s; %s", dstSpace, addListenerGql)
+
+	logs.Info("Copying listener: %s", addListenerGql)
+
+	_, _, err = dao.Execute(nsid, fullGql, nil)
+	if err != nil {
+		return false, fmt.Errorf("add listener failed: %w", err)
+	}
+
+	logs.Info("Listener copied successfully")
+	return true, nil
+}
+
 
 func createIndexes(nsid, srcSpace, dstSpace string) error {
 	tagIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW TAG INDEXES", srcSpace), nil)
