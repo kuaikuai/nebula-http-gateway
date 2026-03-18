@@ -17,21 +17,21 @@ import (
 )
 
 type StorageScanner struct {
-	nsid        string
-	storageAddr string
-	client      *storage.GraphStorageServiceClient
-	spaceID     nebula.GraphSpaceID
-	spaceName   string
-	partInfo    []PartitionInfo
-	sessionID   int64
+	nsid           string
+	storageAddr    string
+	client         *storage.GraphStorageServiceClient
+	spaceID        nebula.GraphSpaceID
+	spaceName      string
+	partInfo       []PartitionInfo
+	sessionID      int64
 	storageClients map[string]*storage.GraphStorageServiceClient
 }
 
 func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 	scanner := &StorageScanner{
-		nsid:      nsid,
-		spaceName: spaceName,
-		storageClients: make(map[string]*storage.GraphStorageServiceClient,0),
+		nsid:           nsid,
+		spaceName:      spaceName,
+		storageClients: make(map[string]*storage.GraphStorageServiceClient, 0),
 	}
 	spaceID, err := scanner.getSpaceID(spaceName)
 	if err != nil {
@@ -67,7 +67,6 @@ func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 		scanner.storageClients[addr] = client
 	}
 
-
 	return scanner, nil
 }
 
@@ -79,7 +78,6 @@ func (s *StorageScanner) Close() error {
 	}
 	return nil
 }
-
 
 func (s *StorageScanner) getStorageAddresses() ([]string, error) {
 	gql := fmt.Sprintf("USE %s; SHOW HOSTS STORAGE", s.spaceName)
@@ -126,7 +124,6 @@ func (s *StorageScanner) getPartitionInfo() ([]PartitionInfo, error) {
 	}
 	return parts, nil
 }
-
 
 func (s *StorageScanner) getSpaceID(spaceName string) (nebula.GraphSpaceID, error) {
 	result, _, err := dao.Execute(s.nsid, fmt.Sprintf("DESCRIBE SPACE %s", spaceName), nil)
@@ -280,9 +277,9 @@ func createStorageClient(addr string) (*storage.GraphStorageServiceClient, error
 }
 
 type partState struct {
-	cursor   *storage.ScanCursor
-	done     bool
-	leader   string // 新增：该分区对应的 storage 地址
+	cursor *storage.ScanCursor
+	done   bool
+	leader string // 新增：该分区对应的 storage 地址
 }
 
 func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler func([]map[string]interface{}) error) error {
@@ -449,7 +446,7 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 			break
 		}
 
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 
 	return nil
@@ -595,7 +592,6 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 
 	return nil
 }
-
 
 func (s *StorageScanner) valueToString(val *nebula.Value) string {
 	if val == nil {

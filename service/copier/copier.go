@@ -9,6 +9,36 @@ import (
 	"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/dao"
 )
 
+const (
+	maxRetries    = 6
+	retryInterval = 5 * time.Second
+)
+
+// executeWithRetry 带重试的Execute，超时错误会重试
+func executeWithRetry(nsid, gql string) (interface{}, interface{}, error) {
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		result, warn, err := dao.Execute(nsid, gql, nil)
+		if err == nil {
+			return result, warn, nil
+		}
+
+		// 仅超时错误重试
+		if !isTimeoutError(err) {
+			return result, warn, err
+		}
+
+		lastErr = err
+		logs.Warn("[RETRY] Timeout error, retrying %d/%d: %s", i+1, maxRetries, gql)
+
+		// 指数退避: 2s, 4s, 6s
+		sleepDuration := retryInterval * time.Duration(i+1)
+		time.Sleep(sleepDuration)
+	}
+
+	return nil, nil, fmt.Errorf("max retries (%d) exceeded for timeout: %w", maxRetries, lastErr)
+}
+
 // dropSpaceIfExists 检查并删除 space
 func dropSpaceIfExists(nsid string, spaceName string) error {
 	result, _, err := dao.Execute(nsid, "SHOW SPACES", nil)
@@ -22,7 +52,7 @@ func dropSpaceIfExists(nsid string, spaceName string) error {
 			if err != nil {
 				return err
 			}
-			logs.Info("[DEBUG] Dropped existing space: %s", spaceName)
+			logs.Info("Dropped existing space: %s", spaceName)
 			return nil
 		}
 	}
@@ -40,7 +70,7 @@ func CopySpace(nsid, srcSpace, dstSpace string, force bool) error {
 		}
 	}
 
-err := createSpace(nsid, srcSpace, dstSpace)
+	err := createSpace(nsid, srcSpace, dstSpace)
 	if err != nil {
 		return fmt.Errorf("failed to create space: %v", err)
 	}
@@ -65,7 +95,7 @@ err := createSpace(nsid, srcSpace, dstSpace)
 	if haveListeners {
 		if err := copyFulltextIndexes(nsid, srcSpace, dstSpace); err != nil {
 			return fmt.Errorf("failed to copy fulltext indexes: %w", err)
-    }
+		}
 	}
 
 	tags, err := getTags(nsid, srcSpace)
@@ -179,14 +209,14 @@ func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
 	}
 
 	if len(result.Tables) == 0 {
-		logs.Info("[DEBUG] No fulltext indexes found in source space")
+		logs.Info("No fulltext indexes found in source space")
 		return nil
 	}
 
 	// 3. 解析并创建全文本索引
 	for _, row := range result.Tables {
 		indexName, _ := row["Name"].(string)
-		schemaType, _ := row["Schema Type"].(string)  // Tag 或 Edge
+		schemaType, _ := row["Schema Type"].(string) // Tag 或 Edge
 		schemaName, _ := row["Schema Name"].(string)
 		fields, _ := row["Fields"].(string)
 		analyzer, _ := row["Analyzer"].(string)
@@ -212,7 +242,7 @@ func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
 
 		fullGql := fmt.Sprintf("USE %s; %s", dstSpace, createGql)
 
-		logs.Info("[DEBUG] Creating fulltext index: %s (original: %s)", newIndexName, indexName)
+		logs.Info("Creating fulltext index: %s (original: %s)", newIndexName, indexName)
 
 		_, _, err = dao.Execute(nsid, fullGql, nil)
 		if err != nil {
@@ -220,12 +250,12 @@ func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
 		}
 	}
 
-	logs.Info("[DEBUG] Fulltext indexes copied successfully")
+	logs.Info("Fulltext indexes copied successfully")
 	return nil
 }
 
 // copyListeners 复制 LISTENER 配置到新 space
-func copyListeners(nsid, srcSpace, dstSpace string) (bool,error) {
+func copyListeners(nsid, srcSpace, dstSpace string) (bool, error) {
 	// 1. 在原 space 获取 LISTENER 信息
 	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW LISTENER", srcSpace), nil)
 	if err != nil {
@@ -233,7 +263,7 @@ func copyListeners(nsid, srcSpace, dstSpace string) (bool,error) {
 	}
 
 	if len(result.Tables) == 0 {
-		logs.Info("[DEBUG] No listeners found in source space")
+		logs.Info("No listeners found in source space")
 		return false, nil
 	}
 
@@ -267,7 +297,6 @@ func copyListeners(nsid, srcSpace, dstSpace string) (bool,error) {
 	logs.Info("Listener copied successfully")
 	return true, nil
 }
-
 
 func createIndexes(nsid, srcSpace, dstSpace string) error {
 	tagIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW TAG INDEXES", srcSpace), nil)
@@ -380,10 +409,9 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 		}
 		insertGql := fmt.Sprintf("USE %s; INSERT VERTEX %s() VALUES %s",
 			dstSpace, tag, strings.Join(valueParts, ", "))
-		fmt.Printf("[DEBUG] Insert vertex GQL: %s\n", insertGql)
-		_, _, err := dao.Execute(nsid, insertGql, nil)
+		_, _, err := executeWithRetry(nsid, insertGql)
 		if err != nil {
-			fmt.Printf("[ERROR] Insert vertex failed: %v\n", err)
+			logs.Error("Insert vertex failed: %v, GQL=%s", err, insertGql)
 		}
 		return err
 	}
@@ -412,10 +440,9 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 	propList := strings.Join(allKeys, ", ")
 	insertGql := fmt.Sprintf("USE %s; INSERT VERTEX %s(%s) VALUES %s",
 		dstSpace, tag, propList, strings.Join(valueParts, ", "))
-	fmt.Printf("[DEBUG] Insert vertex GQL: %s\n", insertGql)
-	_, _, err := dao.Execute(nsid, insertGql, nil)
+	_, _, err := executeWithRetry(nsid, insertGql)
 	if err != nil {
-		fmt.Printf("[ERROR] Insert vertex failed: %v\n", err)
+		logs.Error("Insert vertex failed: %v, GQL=%s", err, insertGql)
 	}
 	return err
 }
@@ -473,14 +500,13 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 		}
 		insertGql := fmt.Sprintf("USE %s; INSERT EDGE %s() VALUES %s",
 			dstSpace, edge, strings.Join(valueParts, ", "))
-		fmt.Printf("[DEBUG] Insert edge GQL: %s\n", insertGql)
-		_, _, err := dao.Execute(nsid, insertGql, nil)
+		_, _, err := executeWithRetry(nsid, insertGql)
 		if err != nil {
-			fmt.Printf("[ERROR] Insert edge failed: %v\n", err)
+			logs.Error("Insert edge failed: %v, GQL=%s", err, insertGql)
 		}
 		return err
 	}
-	fmt.Printf("[DEBUG] edge allkeys:%v\n", allKeys)
+	//logs.Info("edge allkeys: %v", allKeys)
 	propList := strings.Join(allKeys, ", ")
 	var valueParts []string
 	for _, e := range edges {
@@ -506,10 +532,9 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 
 	insertGql := fmt.Sprintf("USE %s; INSERT EDGE %s(%s) VALUES %s",
 		dstSpace, edge, propList, strings.Join(valueParts, ", "))
-	fmt.Printf("[DEBUG] Insert edge GQL: %s\n", insertGql)
-	_, _, err := dao.Execute(nsid, insertGql, nil)
+	_, _, err := executeWithRetry(nsid, insertGql)
 	if err != nil {
-		fmt.Printf("[ERROR] Insert edge failed: %v\n", err)
+		logs.Error("Insert edge failed: %v, GQL=%s", err, insertGql)
 	}
 	return err
 }
