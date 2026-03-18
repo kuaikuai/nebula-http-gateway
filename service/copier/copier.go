@@ -4,15 +4,43 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
 	"github.com/astaxie/beego/logs"
 	"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/dao"
 )
 
+// dropSpaceIfExists 检查并删除 space
+func dropSpaceIfExists(nsid string, spaceName string) error {
+	result, _, err := dao.Execute(nsid, "SHOW SPACES", nil)
+	if err != nil {
+		return err
+	}
+
+	for _, row := range result.Tables {
+		if name, ok := row["Name"].(string); ok && name == spaceName {
+			_, _, err := dao.Execute(nsid, fmt.Sprintf("DROP SPACE %s", spaceName), nil)
+			if err != nil {
+				return err
+			}
+			logs.Info("[DEBUG] Dropped existing space: %s", spaceName)
+			return nil
+		}
+	}
+	return nil
+}
+
 const defaultBatchSize = 1000
 
 // CopySpace copies all data from srcSpace to dstSpace
-func CopySpace(nsid, srcSpace, dstSpace string) error {
-	err := createSpace(nsid, srcSpace, dstSpace)
+func CopySpace(nsid, srcSpace, dstSpace string, force bool) error {
+	// 如果 force 为 true，先检查并删除已存在的 space
+	if force {
+		if err := dropSpaceIfExists(nsid, dstSpace); err != nil {
+			return fmt.Errorf("failed to drop existing space: %w", err)
+		}
+	}
+
+err := createSpace(nsid, srcSpace, dstSpace)
 	if err != nil {
 		return fmt.Errorf("failed to create space: %v", err)
 	}
