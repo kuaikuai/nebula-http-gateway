@@ -38,7 +38,7 @@ func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 		return nil, fmt.Errorf("failed to get space ID: %w", err)
 	}
 	scanner.spaceID = spaceID
-	logs.Info("[DEBUG] SpaceID: %v", spaceID)
+	logs.Info("new scanner spaceName:%s spaceID: %v", spaceName, spaceID)
 	// 获取分区信息（包括 Leader）
 	partInfo, err := scanner.getPartitionInfo()
 	if err != nil {
@@ -59,7 +59,7 @@ func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 
 	// 为每个唯一地址创建 client
 	for addr := range uniqueAddrs {
-		logs.Info("[DEBUG] Creating storage client for: %s", addr)
+		logs.Info("Creating storage client for: %s", addr)
 		client, err := createStorageClient(addr)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create storage client for %s: %w", addr, err)
@@ -158,14 +158,10 @@ func (s *StorageScanner) getTagID(tagName string) (nebula.TagID, error) {
 	if err != nil {
 		return 0, err
 	}
-
-	logs.Info("[DEBUG] EXPLAIN result: %v", result.Tables)
-
 	for _, row := range result.Tables {
 		if opName, ok := row["name"].(string); ok {
 			if opName == "ScanVertices" {
 				if opInfo, ok := row["operator info"].(string); ok {
-					logs.Info("[DEBUG] ScanVertices operator info: %v", opInfo)
 					if tagID, found := extractTagID(opInfo); found {
 						return nebula.TagID(tagID), nil
 					}
@@ -174,7 +170,8 @@ func (s *StorageScanner) getTagID(tagName string) (nebula.TagID, error) {
 		}
 	}
 
-	return 0, fmt.Errorf("tag ID not found for %s", tagName)
+	return 0, fmt.Errorf("tag ID not found for %s, result tables:%v",
+		tagName, result.Tables)
 }
 
 func extractTagID(opInfo string) (int64, bool) {
@@ -207,14 +204,10 @@ func (s *StorageScanner) getEdgeID(edgeName string) (nebula.EdgeType, error) {
 	if err != nil {
 		return 0, err
 	}
-
-	logs.Info("[DEBUG] EXPLAIN result: %v", result.Tables)
-
 	for _, row := range result.Tables {
 		if opName, ok := row["name"].(string); ok {
 			if opName == "Traverse" {
 				if opInfo, ok := row["operator info"].(string); ok {
-					logs.Info("[DEBUG] ScanEdges operator info: %v", opInfo)
 					if edgeTypeID, found := extractEdgeTypeID(opInfo); found {
 						return nebula.EdgeType(edgeTypeID), nil
 					}
@@ -223,7 +216,8 @@ func (s *StorageScanner) getEdgeID(edgeName string) (nebula.EdgeType, error) {
 		}
 	}
 
-	return 0, fmt.Errorf("edge ID not found for %s", edgeName)
+	return 0, fmt.Errorf("edge ID not found for %s, result tables:%v",
+		edgeName, result.Tables)
 }
 
 func extractEdgeTypeID(opInfo string) (int64, bool) {
@@ -283,15 +277,12 @@ type partState struct {
 }
 
 func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler func([]map[string]interface{}) error) error {
-	logs.Info("[DEBUG] ScanVertices spaceID: %v", s.spaceID)
-	logs.Info("[DEBUG] ScanVertices tagName: %v", tagName)
-
+	logs.Info("scanVertices spaceName: %s, spaceID: %v, tagName: %v", s.spaceName, s.spaceID, tagName)
 	tagID, err := s.getTagID(tagName)
 	if err != nil {
 		return fmt.Errorf("failed to get tag ID: %w", err)
 	}
-	logs.Info("[DEBUG] ScanVertices tagID: %v", tagID)
-
+	logs.Info("ScanVertices tagID: %v", tagID)
 	// 初始化分区状态
 	partStates := make(map[nebula.PartitionID]*partState)
 	for _, p := range s.partInfo {
@@ -360,9 +351,9 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 
 			failedParts := resp.GetResult_().GetFailedParts()
 			for _, part := range failedParts {
-				if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
-					continue
-				}
+				// if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
+				// 	continue
+				// }
 				if part.GetCode() != nebula.ErrorCode_SUCCEEDED {
 					logs.Error("scan failed on partition %d: error code %d", part.GetPartID(), part.GetCode())
 					continue
@@ -378,7 +369,7 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 			hasData = true
 
 			columnNames := vertexData.GetColumnNames()
-			logs.Info("[DEBUG] ScanVertices partition %d columnNames: %v", pid, columnNames)
+			//logs.Info("[DEBUG] ScanVertices partition %d columnNames: %v", pid, columnNames)
 
 			for _, row := range vertexData.GetRows() {
 				values := row.GetValues()
@@ -453,11 +444,13 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 }
 
 func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func([]map[string]interface{}) error) error {
+	logs.Info("ScanEdges spaceName: %s, spaceID: %v edgeName: %s",
+		s.spaceName, s.spaceID, edgeName)
 	edgeType, err := s.getEdgeID(edgeName)
 	if err != nil {
 		return fmt.Errorf("failed to get edge ID: %w", err)
 	}
-	logs.Info("[DEBUG] ScanEdges edgeName: %v edgeType: %v", edgeName, edgeType)
+	logs.Info("edgeName %v, edgeType: %v", edgeName, edgeType)
 
 	// 初始化分区状态
 	partStates := make(map[nebula.PartitionID]*partState)
@@ -527,9 +520,9 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 
 			failedParts := resp.GetResult_().GetFailedParts()
 			for _, part := range failedParts {
-				if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
-					continue
-				}
+				// if part.GetCode() == nebula.ErrorCode_E_PART_NOT_FOUND {
+				// 	continue
+				// }
 				if part.GetCode() != nebula.ErrorCode_SUCCEEDED {
 					logs.Error("scan failed on partition %d, spaceID %d: rror code %d", part.GetPartID(), s.spaceID, part.GetCode())
 					continue
