@@ -220,6 +220,26 @@ func (s *StorageScanner) getEdgeID(edgeName string) (nebula.EdgeType, error) {
 		edgeName, result.Tables)
 }
 
+// getEdgeProps 获取 edge 的所有属性名
+func (s *StorageScanner) getEdgeProps(edgeName string) ([]string, error) {
+	descGql := fmt.Sprintf("USE %s; DESCRIBE EDGE %s", s.spaceName, edgeName)
+	descResult, _, err := dao.Execute(s.nsid, descGql, nil)
+	if err != nil {
+		return nil, fmt.Errorf("describe edge failed: %w", err)
+	}
+
+	var props []string
+	for _, row := range descResult.Tables {
+		if name, ok := row["Field"].(string); ok {
+			if name == "_src" || name == "_dst" || name == "_rank" || name == "_type" {
+				continue
+			}
+			props = append(props, name)
+		}
+	}
+	return props, nil
+}
+
 func extractEdgeTypeID(opInfo string) (int64, bool) {
 	re := regexp.MustCompile(`"type":\s*(\d+)`)
 	matches := re.FindAllStringSubmatch(opInfo, -1)
@@ -273,7 +293,16 @@ func createStorageClient(addr string) (*storage.GraphStorageServiceClient, error
 type partState struct {
 	cursor *storage.ScanCursor
 	done   bool
-	leader string // 新增：该分区对应的 storage 地址
+	leader string
+}
+
+// initPartitions 初始化分区状态
+func (s *StorageScanner) initPartitions() map[nebula.PartitionID]*partState {
+	partStates := make(map[nebula.PartitionID]*partState)
+	for _, p := range s.partInfo {
+		partStates[p.PartID] = &partState{leader: p.Leader}
+	}
+	return partStates
 }
 
 func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler func([]map[string]interface{}) error) error {
@@ -284,10 +313,7 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 	}
 	logs.Info("ScanVertices tagID: %v", tagID)
 	// 初始化分区状态
-	partStates := make(map[nebula.PartitionID]*partState)
-	for _, p := range s.partInfo {
-		partStates[p.PartID] = &partState{leader: p.Leader}
-	}
+	partStates := s.initPartitions()
 
 	batch := make([]map[string]interface{}, 0, batchSize)
 	flushBatch := func() error {
@@ -452,11 +478,14 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 	}
 	logs.Info("edgeName %v, edgeType: %v", edgeName, edgeType)
 
-	// 初始化分区状态
-	partStates := make(map[nebula.PartitionID]*partState)
-	for _, p := range s.partInfo {
-		partStates[p.PartID] = &partState{leader: p.Leader}
+	// 获取 edge 的所有属性
+	edgeProps, err := s.getEdgeProps(edgeName)
+	if err != nil {
+		return fmt.Errorf("failed to get edge props: %w", err)
 	}
+
+	// 初始化分区状态
+	partStates := s.initPartitions()
 
 	batch := make([]map[string]interface{}, 0, batchSize)
 	flushBatch := func() error {
@@ -475,8 +504,14 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 		SessionID: &sessionIDVal,
 	}
 
+	// 构建返回列：系统属性 + 自定义属性
+	props := [][]byte{[]byte("_src"), []byte("_type"), []byte("_rank"), []byte("_dst")}
+	for _, prop := range edgeProps {
+		props = append(props, []byte(prop))
+	}
+
 	returnColumns := []*storage.EdgeProp{
-		{Type: edgeType, Props: [][]byte{[]byte("_src"), []byte("_type"), []byte("_rank"), []byte("_dst")}},
+		{Type: edgeType, Props: props},
 	}
 
 	for {
@@ -536,10 +571,11 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 			}
 
 			hasData = true
+			columnNames := edgeData.GetColumnNames()
 
 			for _, row := range edgeData.GetRows() {
 				values := row.GetValues()
-				if len(values) < 3 {
+				if len(values) < 4 {
 					continue
 				}
 
@@ -553,6 +589,16 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 				propsMap["_src"] = srcID
 				propsMap["_dst"] = dstID
 				propsMap["_rank"] = rank
+
+				// 添加自定义属性
+				for i := 4; i < len(values) && i-4 < len(columnNames)-4; i++ {
+					propName := string(columnNames[i])
+					// 跳过系统属性前缀
+					if idx := strings.Index(propName, "."); idx > 0 {
+						propName = propName[idx+1:]
+					}
+					propsMap[propName] = s.valueToInterface(values[i])
+				}
 
 				batch = append(batch, propsMap)
 
