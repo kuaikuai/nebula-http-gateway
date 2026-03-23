@@ -119,6 +119,17 @@ func CopySpace(nsid, srcSpace, dstSpace string, force bool, partitionNum, replic
 		return fmt.Errorf("failed to copy edges: %v", err)
 	}
 
+	// 执行负载均衡
+	logs.Info("Submitting job to balance leader distribution...")
+	balanceGql := fmt.Sprintf("USE %s; SUBMIT JOB BALANCE LEADER", dstSpace)
+	_, _, err = dao.Execute(nsid, balanceGql, nil)
+	if err != nil {
+		logs.Warn("Balance leader job submission failed: %v", err)
+		// 不阻塞复制流程，仅记录警告
+	} else {
+		logs.Info("Balance leader job submitted successfully")
+	}
+
 	return nil
 }
 
