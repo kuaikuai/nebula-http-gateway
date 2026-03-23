@@ -278,7 +278,7 @@ func copyTagsAdvanced(nsid, srcSpace, dstSpace string) error {
 
 			createStmt := ""
 			for _, col := range resp.Headers {
-				if strings.Contains(col, "Create") {
+				if strings.Contains(col, "Create Tag") {
 					if stmt, ok := resp.Tables[0][col].(string); ok {
 						createStmt = stmt
 						break
@@ -315,7 +315,7 @@ func copyEdgesAdvanced(nsid, srcSpace, dstSpace string) error {
 
 			createStmt := ""
 			for _, col := range resp.Headers {
-				if strings.Contains(col, "Create") {
+				if strings.Contains(col, "Create Edge") {
 					if stmt, ok := resp.Tables[0][col].(string); ok {
 						createStmt = stmt
 						break
@@ -623,7 +623,7 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 			continue
 		}
 
-		vidStr := fmt.Sprintf("%v", vid)
+		vidStr := formatVid(vid)
 
 		if len(props) == 0 {
 			values = append(values, fmt.Sprintf("%s: ()", vidStr))
@@ -631,7 +631,7 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 			propVals := make([]string, 0, len(props))
 			for _, p := range props {
 				if val, ok := v[p]; ok {
-					propVals = append(propVals, fmt.Sprintf("%v", val))
+					propVals = append(propVals, formatValue(val))
 				} else {
 					propVals = append(propVals, "NULL")
 				}
@@ -661,7 +661,51 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 	return nil
 }
 
+// formatVid formats the vertex/edge ID for use in INSERT statements
+func formatVid(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return fmt.Sprintf("\"%s\"", escapeString(val))
+	case int, int8, int16, int32, int64:
+		return fmt.Sprintf("%d", val)
+	default:
+		return fmt.Sprintf("\"%s\"", escapeString(fmt.Sprintf("%v", val)))
+	}
+}
+
+// formatValue formats a property value for use in INSERT statements
+func formatValue(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return fmt.Sprintf("\"%s\"", escapeString(val))
+	case int, int8, int16, int32, int64:
+		return fmt.Sprintf("%d", val)
+	case float32:
+		return fmt.Sprintf("%f", val)
+	case float64:
+		return fmt.Sprintf("%f", val)
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	default:
+		return "null"
+	}
+}
+
+// escapeString escapes special characters in a string for Nebula Graph INSERT statements
+func escapeString(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	s = strings.ReplaceAll(s, "\r", "\\r")
+	s = strings.ReplaceAll(s, "\t", "\\t")
+	return s
+}
+
 func copyEdges(nsid, srcSpace, dstSpace string, edges []string) error {
+
 	for _, edge := range edges {
 		logs.Info("Copying edges for type: %s", edge)
 		scanner, err := NewStorageScanner(nsid, srcSpace)
@@ -715,11 +759,11 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 			continue
 		}
 
-		srcStr := fmt.Sprintf("%v", src)
-		dstStr := fmt.Sprintf("%v", dst)
+		srcStr := formatVid(src)
+		dstStr := formatVid(dst)
 		rankStr := "0"
 		if rank != nil {
-			rankStr = fmt.Sprintf("%v", rank)
+			rankStr = formatValue(rank)
 		}
 
 		if len(props) == 0 {
@@ -728,7 +772,7 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 			propVals := make([]string, 0, len(props))
 			for _, p := range props {
 				if val, ok := e[p]; ok {
-					propVals = append(propVals, fmt.Sprintf("%v", val))
+					propVals = append(propVals, formatValue(val))
 				} else {
 					propVals = append(propVals, "NULL")
 				}
