@@ -28,9 +28,12 @@ type ImportActionRequest struct {
 }
 
 type CopyRequest struct {
-	SrcSpace string `json:"src_space"`
-	DstSpace string `json:"dst_space"`
-	Force    bool   `json:"force"`
+	SrcSpace      string `json:"src_space"`
+	DstSpace      string `json:"dst_space"`
+	Force         bool   `json:"force"`
+	PartitionNum  int    `json:"partition_num"`
+	ReplicaFactor int    `json:"replica_factor"`
+	VidType       string `json:"vid_type"`
 }
 
 func (this *TaskController) Import() {
@@ -123,7 +126,7 @@ func (this *TaskController) Copy() {
 
 	// Start async copy in goroutine
 	go func() {
-		err := copier.CopySpace(nsid.(string), params.SrcSpace, params.DstSpace, params.Force)
+		err := copier.CopySpace(nsid.(string), params.SrcSpace, params.DstSpace, params.Force, params.PartitionNum, params.ReplicaFactor, params.VidType)
 		if err != nil {
 			logs.Error(fmt.Sprintf("Failed to copy space: `%s` -> `%s`, error: `%v`", params.SrcSpace, params.DstSpace, err))
 			task.TaskStatus = importer.StatusAborted.String()

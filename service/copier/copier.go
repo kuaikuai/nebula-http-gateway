@@ -62,7 +62,8 @@ func dropSpaceIfExists(nsid string, spaceName string) error {
 const defaultBatchSize = 1000
 
 // CopySpace copies all data from srcSpace to dstSpace
-func CopySpace(nsid, srcSpace, dstSpace string, force bool) error {
+func CopySpace(nsid, srcSpace, dstSpace string, force bool, partitionNum, replicaFactor int, vidType string) error {
+	logs.Info("Starting to copy space from %s to %s (force=%v, partition_num=%v, replica_factor=%v)", srcSpace, dstSpace, force, partitionNum, replicaFactor)
 	// 如果 force 为 true，先检查并删除已存在的 space
 	if force {
 		if err := dropSpaceIfExists(nsid, dstSpace); err != nil {
@@ -70,18 +71,18 @@ func CopySpace(nsid, srcSpace, dstSpace string, force bool) error {
 		}
 	}
 
-	err := createSpace(nsid, srcSpace, dstSpace)
+	err := createSpace(nsid, srcSpace, dstSpace, partitionNum, replicaFactor, vidType)
 	if err != nil {
 		return fmt.Errorf("failed to create space: %v", err)
 	}
 
 	// Wait for space to be ready (metadata sync)
-	fmt.Println("[INFO] Waiting for space to be ready...")
+	logs.Info("Waiting for space to be ready...")
 	err = waitForSpaceReady(nsid, dstSpace)
 	if err != nil {
 		return fmt.Errorf("space not ready: %v", err)
 	}
-	fmt.Println("[INFO] Space is ready")
+	logs.Info("Space is ready")
 
 	err = createIndexes(nsid, srcSpace, dstSpace)
 	if err != nil {
@@ -144,10 +145,193 @@ func waitForSpaceReady(nsid, spaceName string) error {
 	return fmt.Errorf("space %s not ready after %d seconds", spaceName, maxRetries)
 }
 
-func createSpace(nsid, srcSpace, dstSpace string) error {
-	gql := fmt.Sprintf("CREATE SPACE %s AS %s", dstSpace, srcSpace)
-	_, _, err := dao.Execute(nsid, gql, nil)
-	return err
+func createSpace(nsid, srcSpace, dstSpace string, partitionNum, replicaFactor int, vidType string) error {
+	// 判断使用哪种流程
+	if partitionNum == 0 && replicaFactor == 0 && vidType == "" {
+		// 原流程: CREATE SPACE dstSpace AS srcSpace
+		gql := fmt.Sprintf("CREATE SPACE %s AS %s", dstSpace, srcSpace)
+		_, _, err := dao.Execute(nsid, gql, nil)
+		return err
+	}
+
+	// 新流程: 获取源 space 元数据并构建完整 CREATE SPACE 语句
+	desc, err := getSpaceDesc(nsid, srcSpace)
+	if err != nil {
+		return fmt.Errorf("failed to get space desc: %w", err)
+	}
+
+	// 构建 CREATE SPACE 语句
+	gql := buildCreateSpaceGql(dstSpace, desc, partitionNum, replicaFactor, vidType)
+	_, _, err = dao.Execute(nsid, gql, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create space: %w", err)
+	}
+
+	// 复制 tag schema
+	if err := copyTagsAdvanced(nsid, srcSpace, dstSpace); err != nil {
+		return fmt.Errorf("failed to copy tags: %w", err)
+	}
+
+	// 复制 edge schema
+	if err := copyEdgesAdvanced(nsid, srcSpace, dstSpace); err != nil {
+		return fmt.Errorf("failed to copy edges: %w", err)
+	}
+
+	return nil
+}
+
+// SpaceDesc holds the metadata of a space from DESC SPACE
+type SpaceDesc struct {
+	ID            int64
+	Name          string
+	PartitionNum  int
+	ReplicaFactor int
+	Charset       string
+	Collate       string
+	VidType       string
+	Comment       string
+}
+
+// getSpaceDesc 获取 space 的元数据
+func getSpaceDesc(nsid, spaceName string) (*SpaceDesc, error) {
+	gql := fmt.Sprintf("DESC SPACE %s", spaceName)
+	result, _, err := dao.Execute(nsid, gql, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(result.Tables) == 0 {
+		return nil, fmt.Errorf("no result from DESC SPACE %s", spaceName)
+	}
+
+	row := result.Tables[0]
+	desc := &SpaceDesc{}
+
+	if v, ok := row["ID"].(int64); ok {
+		desc.ID = v
+	}
+	if v, ok := row["Name"].(string); ok {
+		desc.Name = v
+	}
+	if v, ok := row["Partition Number"].(int64); ok {
+		desc.PartitionNum = int(v)
+	}
+	if v, ok := row["Replica Factor"].(int64); ok {
+		desc.ReplicaFactor = int(v)
+	}
+	if v, ok := row["Charset"].(string); ok {
+		desc.Charset = v
+	}
+	if v, ok := row["Collate"].(string); ok {
+		desc.Collate = v
+	}
+	if v, ok := row["Vid Type"].(string); ok {
+		desc.VidType = v
+	}
+	if v, ok := row["Comment"].(string); ok {
+		desc.Comment = v
+	}
+
+	return desc, nil
+}
+
+// buildCreateSpaceGql 构建完整的 CREATE SPACE 语句
+func buildCreateSpaceGql(dstSpace string, desc *SpaceDesc, partitionNum, replicaFactor int, vidType string) string {
+	// 使用源 space 的设置作为默认值
+	pNum := desc.PartitionNum
+	replica := desc.ReplicaFactor
+	charset := desc.Charset
+	collate := desc.Collate
+	vType := desc.VidType
+	comment := desc.Comment
+
+	// 参数覆盖默认值
+	if partitionNum > 0 {
+		pNum = partitionNum
+	}
+	if replicaFactor > 0 {
+		replica = replicaFactor
+	}
+	if vidType != "" {
+		vType = vidType
+	}
+
+	return fmt.Sprintf("CREATE SPACE %s (partition_num = %d, replica_factor = %d, charset = %s, collate = %s, vid_type = %s) comment ='%s'",
+		dstSpace, pNum, replica, charset, collate, vType, comment)
+}
+
+// copyTagsAdvanced 逐个复制 tag schema
+func copyTagsAdvanced(nsid, srcSpace, dstSpace string) error {
+	gql := fmt.Sprintf("USE %s; SHOW TAGS", srcSpace)
+	result, _, err := dao.Execute(nsid, gql, nil)
+	if err != nil {
+		return err
+	}
+
+	for _, row := range result.Tables {
+		if name, ok := row["Name"].(string); ok {
+			createGql := fmt.Sprintf("USE %s; SHOW CREATE TAG %s", srcSpace, name)
+			resp, _, err := dao.Execute(nsid, createGql, nil)
+			if err != nil || len(resp.Tables) == 0 {
+				continue
+			}
+
+			createStmt := ""
+			for _, col := range resp.Headers {
+				if strings.Contains(col, "Create") {
+					if stmt, ok := resp.Tables[0][col].(string); ok {
+						createStmt = stmt
+						break
+					}
+				}
+			}
+			if createStmt == "" {
+				continue
+			}
+
+			execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
+			dao.Execute(nsid, execGql, nil)
+		}
+	}
+
+	return nil
+}
+
+// copyEdgesAdvanced 逐个复制 edge schema
+func copyEdgesAdvanced(nsid, srcSpace, dstSpace string) error {
+	gql := fmt.Sprintf("USE %s; SHOW EDGES", srcSpace)
+	result, _, err := dao.Execute(nsid, gql, nil)
+	if err != nil {
+		return err
+	}
+
+	for _, row := range result.Tables {
+		if name, ok := row["Name"].(string); ok {
+			createGql := fmt.Sprintf("USE %s; SHOW CREATE EDGE %s", srcSpace, name)
+			resp, _, err := dao.Execute(nsid, createGql, nil)
+			if err != nil || len(resp.Tables) == 0 {
+				continue
+			}
+
+			createStmt := ""
+			for _, col := range resp.Headers {
+				if strings.Contains(col, "Create") {
+					if stmt, ok := resp.Tables[0][col].(string); ok {
+						createStmt = stmt
+						break
+					}
+				}
+			}
+			if createStmt == "" {
+				continue
+			}
+
+			execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
+			dao.Execute(nsid, execGql, nil)
+		}
+	}
+
+	return nil
 }
 
 func getTags(nsid, space string) ([]string, error) {
@@ -199,13 +383,14 @@ func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
 	// 1. 获取 dstSpace 的 ID
 	dstSpaceID, err := getSpaceID(nsid, dstSpace)
 	if err != nil {
-		return fmt.Errorf("failed to get dst space ID: %w", err)
+		return err
 	}
 
-	// 2. 在原 space 获取全文本索引信息
-	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW FULLTEXT INDEXES", srcSpace), nil)
+	// 2. 获取源 space 的全文本索引配置
+	gql := fmt.Sprintf("USE %s; SHOW FULLTEXT INDEXES", srcSpace)
+	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return fmt.Errorf("show fulltext indexes failed: %w", err)
+		return err
 	}
 
 	if len(result.Tables) == 0 {
@@ -213,40 +398,49 @@ func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
 		return nil
 	}
 
-	// 3. 解析并创建全文本索引
 	for _, row := range result.Tables {
-		indexName, _ := row["Name"].(string)
-		schemaType, _ := row["Schema Type"].(string) // Tag 或 Edge
-		schemaName, _ := row["Schema Name"].(string)
-		fields, _ := row["Fields"].(string)
-		analyzer, _ := row["Analyzer"].(string)
+		var newIndexName string
+		if indexName, ok := row["Name"].(string); ok {
+			// 为索引名添加 space ID 后缀以避免冲突
+			newIndexName = fmt.Sprintf("%s_%d", indexName, dstSpaceID)
 
-		if indexName == "" || schemaName == "" || fields == "" {
-			continue
-		}
+			// 获取原索引的创建语句
+			descGql := fmt.Sprintf("USE %s; SHOW CREATE TAG INDEX %s", srcSpace, indexName)
+			descResult, _, err := dao.Execute(nsid, descGql, nil)
+			if err != nil {
+				logs.Warn("Failed to get fulltext index %s: %v", indexName, err)
+				continue
+			}
 
-		// 在索引名后加上 space ID 避免冲突
-		newIndexName := fmt.Sprintf("%s_%d", indexName, dstSpaceID)
+			if len(descResult.Tables) == 0 {
+				continue
+			}
 
-		// 4. 生成 CREATE FULLTEXT INDEX nGQL
-		var createGql string
-		if schemaType == "Tag" {
-			createGql = fmt.Sprintf("CREATE FULLTEXT TAG INDEX %s ON %s(%s) ANALYZER=\"%s\"",
-				newIndexName, schemaName, fields, analyzer)
-		} else if schemaType == "Edge" {
-			createGql = fmt.Sprintf("CREATE FULLTEXT EDGE INDEX %s ON %s(%s) ANALYZER=\"%s\"",
-				newIndexName, schemaName, fields, analyzer)
-		} else {
-			continue
-		}
+			// 解析创建语句
+			var createStmt string
+			for _, col := range descResult.Headers {
+				if strings.Contains(col, "Create") {
+					if stmt, ok := descResult.Tables[0][col].(string); ok {
+						createStmt = stmt
+						break
+					}
+				}
+			}
 
-		fullGql := fmt.Sprintf("USE %s; %s", dstSpace, createGql)
+			if createStmt == "" {
+				continue
+			}
 
-		logs.Info("Creating fulltext index: %s (original: %s)", newIndexName, indexName)
+			// 修改索引名
+			newCreateStmt := strings.Replace(createStmt, indexName, newIndexName, 1)
 
-		_, _, err = dao.Execute(nsid, fullGql, nil)
-		if err != nil {
-			return fmt.Errorf("create fulltext index %s failed: %w", newIndexName, err)
+			logs.Info("Creating fulltext index: %s (original: %s)", newIndexName, indexName)
+
+			// 在目标 space 创建索引
+			execGql := fmt.Sprintf("USE %s; %s", dstSpace, newCreateStmt)
+			if _, _, err := dao.Execute(nsid, execGql, nil); err != nil {
+				logs.Warn("Failed to create fulltext index %s: %v", newIndexName, err)
+			}
 		}
 	}
 
@@ -254,12 +448,41 @@ func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
 	return nil
 }
 
-// copyListeners 复制 LISTENER 配置到新 space
+// copyFulltextIndex 复制单个全文本索引
+func copyFulltextIndex(nsid, srcSpace, dstSpace string, indexName string) error {
+	// 获取原索引的创建语句
+	descGql := fmt.Sprintf("USE %s; SHOW CREATE TAG INDEX %s", srcSpace, indexName)
+	result, _, err := dao.Execute(nsid, descGql, nil)
+	if err != nil || len(result.Tables) == 0 {
+		return err
+	}
+
+	// 解析创建语句
+	var createStmt string
+	for _, col := range result.Headers {
+		if strings.Contains(col, "Create") {
+			if stmt, ok := result.Tables[0][col].(string); ok {
+				createStmt = stmt
+				break
+			}
+		}
+	}
+
+	if createStmt == "" {
+		return fmt.Errorf("cannot find create statement for index %s", indexName)
+	}
+
+	// 在目标 space 创建索引
+	execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
+	_, _, err = dao.Execute(nsid, execGql, nil)
+	return err
+}
+
 func copyListeners(nsid, srcSpace, dstSpace string) (bool, error) {
-	// 1. 在原 space 获取 LISTENER 信息
+	// 获取 listener 配置
 	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW LISTENER", srcSpace), nil)
 	if err != nil {
-		return false, fmt.Errorf("show listener failed: %w", err)
+		return false, err
 	}
 
 	if len(result.Tables) == 0 {
@@ -267,34 +490,21 @@ func copyListeners(nsid, srcSpace, dstSpace string) (bool, error) {
 		return false, nil
 	}
 
-	// 2. 提取 ELASTICSEARCH 类型的 Host
-	var hosts []string
 	for _, row := range result.Tables {
-		if listenerType, ok := row["Type"].(string); ok && listenerType == "ELASTICSEARCH" {
+		if listenerType, ok := row["Type"].(string); ok {
 			if host, ok := row["Host"].(string); ok {
-				hosts = append(hosts, host)
+				// 构建创建 listener 的语句
+				// 格式: CREATE LISTENER ELASTICSEARCH ON SPACE xxx TO "http://host:port"
+				listenerGql := fmt.Sprintf("USE %s; CREATE LISTENER %s ON %s TO \"%s\"",
+					dstSpace, listenerType, dstSpace, host)
+				_, _, err := dao.Execute(nsid, listenerGql, nil)
+				if err != nil {
+					logs.Warn("Failed to create listener: %v", err)
+				}
 			}
 		}
 	}
 
-	if len(hosts) == 0 {
-		logs.Info("No ELASTICSEARCH listeners found")
-		return false, nil
-	}
-
-	// 3. 生成 ADD LISTENER nGQL 并执行
-	hostsStr := strings.Join(hosts, ",")
-	addListenerGql := fmt.Sprintf("ADD LISTENER ELASTICSEARCH %s", hostsStr)
-	fullGql := fmt.Sprintf("USE %s; %s", dstSpace, addListenerGql)
-
-	logs.Info("Copying listener: %s", addListenerGql)
-
-	_, _, err = dao.Execute(nsid, fullGql, nil)
-	if err != nil {
-		return false, fmt.Errorf("add listener failed: %w", err)
-	}
-
-	logs.Info("Listener copied successfully")
 	return true, nil
 }
 
@@ -360,25 +570,29 @@ func createEdgeIndex(nsid, srcSpace, dstSpace, indexName string) error {
 }
 
 func copyVertices(nsid, srcSpace, dstSpace string, tags []string) error {
-	scanner, err := NewStorageScanner(nsid, srcSpace)
-	if err != nil {
-		return fmt.Errorf("failed to create storage scanner: %v", err)
-	}
-	defer scanner.Close()
-
 	for _, tag := range tags {
-		err := scanAndCopyVerticesWithStorage(scanner, nsid, dstSpace, tag)
+		logs.Info("Copying vertices for tag: %s", tag)
+		scanner, err := NewStorageScanner(nsid, srcSpace)
 		if err != nil {
-			return fmt.Errorf("failed to copy vertices for tag %s: %v", tag, err)
+			return err
+		}
+		defer scanner.Close()
+
+		// 扫描源 space 的 vertex
+		err = scanner.ScanVertices(tag, defaultBatchSize, func(vertices []map[string]interface{}) error {
+			logs.Info("Scanned %d vertices for tag %s", len(vertices), tag)
+			// 批量插入到目标 space
+			if err := insertVertexBatch(nsid, dstSpace, tag, vertices); err != nil {
+				logs.Error("Insert vertex failed: %v", err)
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 	return nil
-}
-
-func scanAndCopyVerticesWithStorage(scanner *StorageScanner, nsid, dstSpace, tag string) error {
-	return scanner.ScanVertices(tag, defaultBatchSize, func(vertices []map[string]interface{}) error {
-		return insertVertexBatch(nsid, dstSpace, tag, vertices)
-	})
 }
 
 func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interface{}) error {
@@ -386,87 +600,91 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 		return nil
 	}
 
-	var allKeys []string
-	keySet := make(map[string]bool)
+	// 构建 INSERT VERTEX 语句
+	// INSERT VERTEX tag_name() VALUES vid: (props)
+	// 或 INSERT VERTEX tag_name(prop1, prop2) VALUES vid: (values)
+
+	// 收集属性名
+	props := make([]string, 0)
 	for _, v := range vertices {
 		for k := range v {
-			if !keySet[k] && k != "vid" && k != "v" && k != "type" {
-				keySet[k] = true
-				allKeys = append(allKeys, k)
+			if k != "vid" && k != "_vid" {
+				props = append(props, k)
 			}
 		}
+		break
 	}
 
-	if len(allKeys) == 0 {
-		var valueParts []string
-		for _, v := range vertices {
-			if vid, ok := v["vid"]; ok {
-				valueParts = append(valueParts, fmt.Sprintf("%s:()", formatVid(vid)))
-			}
-		}
-		if len(valueParts) == 0 {
-			return nil
-		}
-		insertGql := fmt.Sprintf("USE %s; INSERT VERTEX %s() VALUES %s",
-			dstSpace, tag, strings.Join(valueParts, ", "))
-		_, _, err := executeWithRetry(nsid, insertGql)
-		if err != nil {
-			logs.Error("Insert vertex failed: %v, GQL=%s", err, insertGql)
-		}
-		return err
-	}
-
-	var valueParts []string
+	// 构建批量插入语句
+	values := make([]string, 0, len(vertices))
 	for _, v := range vertices {
 		vid := v["vid"]
 		if vid == nil {
 			continue
 		}
-		var values []string
-		for _, k := range allKeys {
-			if val, ok := v[k]; ok {
-				values = append(values, formatValue(val))
-			} else {
-				values = append(values, "null")
+
+		vidStr := fmt.Sprintf("%v", vid)
+
+		if len(props) == 0 {
+			values = append(values, fmt.Sprintf("%s: ()", vidStr))
+		} else {
+			propVals := make([]string, 0, len(props))
+			for _, p := range props {
+				if val, ok := v[p]; ok {
+					propVals = append(propVals, fmt.Sprintf("%v", val))
+				} else {
+					propVals = append(propVals, "NULL")
+				}
 			}
+			values = append(values, fmt.Sprintf("%s: (%s)", vidStr, strings.Join(propVals, ", ")))
 		}
-		valueParts = append(valueParts, fmt.Sprintf("%s:(%s)", formatVid(vid), strings.Join(values, ", ")))
 	}
 
-	if len(valueParts) == 0 {
+	if len(values) == 0 {
 		return nil
 	}
 
-	propList := strings.Join(allKeys, ", ")
-	insertGql := fmt.Sprintf("USE %s; INSERT VERTEX %s(%s) VALUES %s",
-		dstSpace, tag, propList, strings.Join(valueParts, ", "))
+	var insertGql string
+	if len(props) == 0 {
+		insertGql = fmt.Sprintf("USE %s; INSERT VERTEX %s VALUES %s", dstSpace, tag, strings.Join(values, ", "))
+	} else {
+		insertGql = fmt.Sprintf("USE %s; INSERT VERTEX %s(%s) VALUES %s", dstSpace, tag, strings.Join(props, ", "), strings.Join(values, ", "))
+	}
+
+	logs.Info("Insert vertex GQL: %s", insertGql)
 	_, _, err := executeWithRetry(nsid, insertGql)
 	if err != nil {
-		logs.Error("Insert vertex failed: %v, GQL=%s", err, insertGql)
+		logs.Error("Insert vertex failed: %v", err)
+		return err
 	}
-	return err
-}
 
-func copyEdges(nsid, srcSpace, dstSpace string, edges []string) error {
-	scanner, err := NewStorageScanner(nsid, srcSpace)
-	if err != nil {
-		return fmt.Errorf("failed to create storage scanner: %v", err)
-	}
-	defer scanner.Close()
-
-	for _, edge := range edges {
-		err := scanAndCopyEdgesWithStorage(scanner, nsid, dstSpace, edge)
-		if err != nil {
-			return fmt.Errorf("failed to copy edges for %s: %v", edge, err)
-		}
-	}
 	return nil
 }
 
-func scanAndCopyEdgesWithStorage(scanner *StorageScanner, nsid, dstSpace, edge string) error {
-	return scanner.ScanEdges(edge, defaultBatchSize, func(edges []map[string]interface{}) error {
-		return insertEdgeBatch(nsid, dstSpace, edge, edges)
-	})
+func copyEdges(nsid, srcSpace, dstSpace string, edges []string) error {
+	for _, edge := range edges {
+		logs.Info("Copying edges for type: %s", edge)
+		scanner, err := NewStorageScanner(nsid, srcSpace)
+		if err != nil {
+			return err
+		}
+		defer scanner.Close()
+
+		// 扫描源 space 的 edge
+		err = scanner.ScanEdges(edge, defaultBatchSize, func(edges []map[string]interface{}) error {
+			logs.Info("Scanned %d edges for type %s", len(edges), edge)
+			// 批量插入到目标 space
+			if err := insertEdgeBatch(nsid, dstSpace, edge, edges); err != nil {
+				logs.Error("Insert edge failed: %v", err)
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}) error {
@@ -474,112 +692,68 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 		return nil
 	}
 
-	var allKeys []string
-	keySet := make(map[string]bool)
+	// 收集属性名
+	props := make([]string, 0)
 	for _, e := range edges {
 		for k := range e {
-			if !keySet[k] && k != "_src" && k != "_dst" && k != "_rank" && k != "_e" && k != "_type" {
-				keySet[k] = true
-				allKeys = append(allKeys, k)
+			if k != "_src" && k != "_dst" && k != "_rank" {
+				props = append(props, k)
 			}
 		}
+		break
 	}
 
-	if len(allKeys) == 0 {
-		var valueParts []string
-		for _, e := range edges {
-			srcID := e["_src"]
-			dstID := e["_dst"]
-			if srcID == nil || dstID == nil {
-				continue
-			}
-			valueParts = append(valueParts, fmt.Sprintf("%s->%s:()", formatVid(srcID), formatVid(dstID)))
-		}
-		if len(valueParts) == 0 {
-			return nil
-		}
-		insertGql := fmt.Sprintf("USE %s; INSERT EDGE %s() VALUES %s",
-			dstSpace, edge, strings.Join(valueParts, ", "))
-		_, _, err := executeWithRetry(nsid, insertGql)
-		if err != nil {
-			logs.Error("Insert edge failed: %v, GQL=%s", err, insertGql)
-		}
-		return err
-	}
-	//logs.Info("edge allkeys: %v", allKeys)
-	propList := strings.Join(allKeys, ", ")
-	var valueParts []string
+	// 构建批量插入语句
+	// INSERT EDGE edge_name() VALUES src -> dst (rank): ()
+	// 或 INSERT EDGE edge_name(prop1, prop2) VALUES src -> dst (rank): (values)
+	values := make([]string, 0, len(edges))
 	for _, e := range edges {
-		srcID := e["_src"]
-		dstID := e["_dst"]
-		if srcID == nil || dstID == nil {
+		src := e["_src"]
+		dst := e["_dst"]
+		rank := e["_rank"]
+		if src == nil || dst == nil {
 			continue
 		}
-		var values []string
-		for _, k := range allKeys {
-			if val, ok := e[k]; ok {
-				values = append(values, formatValue(val))
-			} else {
-				values = append(values, "null")
-			}
+
+		srcStr := fmt.Sprintf("%v", src)
+		dstStr := fmt.Sprintf("%v", dst)
+		rankStr := "0"
+		if rank != nil {
+			rankStr = fmt.Sprintf("%v", rank)
 		}
-		valueParts = append(valueParts, fmt.Sprintf("%s->%s:(%s)", formatVid(srcID), formatVid(dstID), strings.Join(values, ", ")))
+
+		if len(props) == 0 {
+			values = append(values, fmt.Sprintf("%s -> %s (%s): ()", srcStr, dstStr, rankStr))
+		} else {
+			propVals := make([]string, 0, len(props))
+			for _, p := range props {
+				if val, ok := e[p]; ok {
+					propVals = append(propVals, fmt.Sprintf("%v", val))
+				} else {
+					propVals = append(propVals, "NULL")
+				}
+			}
+			values = append(values, fmt.Sprintf("%s -> %s (%s): (%s)", srcStr, dstStr, rankStr, strings.Join(propVals, ", ")))
+		}
 	}
 
-	if len(valueParts) == 0 {
+	if len(values) == 0 {
 		return nil
 	}
 
-	insertGql := fmt.Sprintf("USE %s; INSERT EDGE %s(%s) VALUES %s",
-		dstSpace, edge, propList, strings.Join(valueParts, ", "))
+	var insertGql string
+	if len(props) == 0 {
+		insertGql = fmt.Sprintf("USE %s; INSERT EDGE %s VALUES %s", dstSpace, edge, strings.Join(values, ", "))
+	} else {
+		insertGql = fmt.Sprintf("USE %s; INSERT EDGE %s(%s) VALUES %s", dstSpace, edge, strings.Join(props, ", "), strings.Join(values, ", "))
+	}
+
+	logs.Info("Insert edge GQL: %s", insertGql)
 	_, _, err := executeWithRetry(nsid, insertGql)
 	if err != nil {
-		logs.Error("Insert edge failed: %v, GQL=%s", err, insertGql)
+		logs.Error("Insert edge failed: %v", err)
+		return err
 	}
-	return err
-}
 
-// formatVid formats the vertex/edge ID for use in INSERT statements
-func formatVid(v interface{}) string {
-	switch val := v.(type) {
-	case string:
-		return fmt.Sprintf("\"%s\"", escapeString(val))
-	case int, int8, int16, int32, int64:
-		return fmt.Sprintf("%d", val)
-	default:
-		// Fallback: convert to string and quote
-		return fmt.Sprintf("\"%s\"", escapeString(fmt.Sprintf("%v", val)))
-	}
-}
-
-// formatValue formats a property value for use in INSERT statements
-func formatValue(v interface{}) string {
-	switch val := v.(type) {
-	case string:
-		return fmt.Sprintf("\"%s\"", escapeString(val))
-	case int, int8, int16, int32, int64:
-		return fmt.Sprintf("%d", val)
-	case float32:
-		return fmt.Sprintf("%f", val)
-	case float64:
-		return fmt.Sprintf("%f", val)
-	case bool:
-		if val {
-			return "true"
-		}
-		return "false"
-	default:
-		return "null"
-	}
-}
-
-// escapeString escapes special characters in a string for Nebula Graph INSERT statements
-func escapeString(s string) string {
-	// Order matters: escape backslash first, then quotes
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
-	s = strings.ReplaceAll(s, "\n", "\\n")
-	s = strings.ReplaceAll(s, "\r", "\\r")
-	s = strings.ReplaceAll(s, "\t", "\\t")
-	return s
+	return nil
 }
