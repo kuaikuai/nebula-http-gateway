@@ -761,14 +761,23 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 
 		srcStr := formatVid(src)
 		dstStr := formatVid(dst)
-		rankStr := "0"
+
+		// 构建边值: rank=0 不显示@rank, rank>0 显示@rank
+		var edgeValue string
+		hasProps := len(props) > 0
+		hasRank := false
 		if rank != nil {
-			rankStr = formatValue(rank)
+			if r, ok := rank.(int64); ok && r != 0 {
+				hasRank = true
+			}
 		}
 
-		if len(props) == 0 {
-			values = append(values, fmt.Sprintf("%s -> %s (%s): ()", srcStr, dstStr, rankStr))
-		} else {
+		if !hasProps && !hasRank {
+			edgeValue = fmt.Sprintf("%s -> %s: ()", srcStr, dstStr)
+		} else if !hasProps && hasRank {
+			rankStr := formatValue(rank)
+			edgeValue = fmt.Sprintf("%s -> %s@%s: ()", srcStr, dstStr, rankStr)
+		} else if hasProps && !hasRank {
 			propVals := make([]string, 0, len(props))
 			for _, p := range props {
 				if val, ok := e[p]; ok {
@@ -777,8 +786,21 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 					propVals = append(propVals, "NULL")
 				}
 			}
-			values = append(values, fmt.Sprintf("%s -> %s (%s): (%s)", srcStr, dstStr, rankStr, strings.Join(propVals, ", ")))
+			edgeValue = fmt.Sprintf("%s -> %s: (%s)", srcStr, dstStr, strings.Join(propVals, ", "))
+		} else {
+			rankStr := formatValue(rank)
+			propVals := make([]string, 0, len(props))
+			for _, p := range props {
+				if val, ok := e[p]; ok {
+					propVals = append(propVals, formatValue(val))
+				} else {
+					propVals = append(propVals, "NULL")
+				}
+			}
+			edgeValue = fmt.Sprintf("%s -> %s@%s: (%s)", srcStr, dstStr, rankStr, strings.Join(propVals, ", "))
 		}
+
+		values = append(values, edgeValue)
 	}
 
 	if len(values) == 0 {
