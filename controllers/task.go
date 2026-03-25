@@ -8,6 +8,7 @@ import (
 	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/logs"
 	"github.com/vesoft-inc/nebula-http-gateway/service/copier"
+	"github.com/vesoft-inc/nebula-http-gateway/service/es"
 	"github.com/vesoft-inc/nebula-http-gateway/service/importer"
 	"github.com/vesoft-inc/nebula-importer/pkg/config"
 
@@ -36,6 +37,14 @@ type CopyRequest struct {
 	ReplicaFactor int    `json:"replica_factor"`
 	VidType       string `json:"vid_type"`
 	Debug         bool   `json:"debug"`
+}
+
+type SyncESRequest struct {
+	Space      string `json:"space"`
+	ESIndex    string `json:"es_index"`
+	BatchSize  int    `json:"batch_size"`
+	ESUsername string `json:"es_username"`
+	ESPassword string `json:"es_password"`
 }
 
 func (this *TaskController) Import() {
@@ -190,6 +199,76 @@ func (this *TaskController) CopyAction() {
 
 	res.Code = -1
 	res.Message = "Unknown action"
+	this.Data["json"] = &res
+	this.ServeJSON()
+}
+
+func (this *TaskController) SyncES() {
+	var res Response
+	var params SyncESRequest
+
+	nsid := this.GetSession(beego.AppConfig.String("sessionkey"))
+	if nsid == nil {
+		res.Code = -1
+		res.Message = "connection refused for lack of session"
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
+	}
+
+	err := json.Unmarshal(this.Ctx.Input.RequestBody, &params)
+	if err != nil {
+		res.Code = -1
+		res.Message = "Invalid request body: " + err.Error()
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
+	}
+
+	if params.Space == "" || params.ESIndex == "" {
+		res.Code = -1
+		res.Message = "space and es_index are required"
+		this.Data["json"] = &res
+		this.ServeJSON()
+		return
+	}
+
+	batchSize := params.BatchSize
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+
+	// 异步执行
+	taskID := importer.NewTaskID()
+	task := importer.NewTask(taskID)
+	importer.GetTaskMgr().PutTask(taskID, &task)
+
+	go func() {
+		syncer, err := es.NewSyncer(nsid.(string), params.Space, params.ESIndex, batchSize, params.ESUsername, params.ESPassword)
+		if err != nil {
+			logs.Error("Failed to create syncer: %v", err)
+			task.TaskStatus = importer.StatusAborted.String()
+			task.TaskMessage = err.Error()
+			return
+		}
+
+		ctx := context.Background()
+		count, err := syncer.Sync(ctx)
+		if err != nil {
+			logs.Error("Failed to sync: %v", err)
+			task.TaskStatus = importer.StatusAborted.String()
+			task.TaskMessage = err.Error()
+		} else {
+			task.TaskStatus = importer.StatusFinished.String()
+			task.TaskMessage = fmt.Sprintf("Synced %d documents", count)
+		}
+	}()
+
+	res.Code = 0
+	res.Data = map[string]interface{}{
+		"task_id": taskID,
+	}
+	res.Message = fmt.Sprintf("Sync task %s submitted successfully", taskID)
 	this.Data["json"] = &res
 	this.ServeJSON()
 }
