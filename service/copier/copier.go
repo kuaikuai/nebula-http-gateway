@@ -1,6 +1,7 @@
 package copier
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -13,6 +14,26 @@ const (
 	maxRetries    = 6
 	retryInterval = 5 * time.Second
 )
+
+type contextKey string
+
+const debugContextKey contextKey = "debug"
+
+// debugLogCtx outputs the nGQL statement if debug mode is enabled (thread-safe)
+func debugLogCtx(ctx context.Context, gql string) {
+	if ctx.Value(debugContextKey).(bool) {
+		logs.Info("[DEBUG nGQL] %s", gql)
+	}
+}
+
+// executeWithGqlError wraps dao.Execute error with GQL statement for better debugging
+func executeWithGqlError(nsid, gql string) error {
+	_, _, err := dao.Execute(nsid, gql, nil)
+	if err != nil {
+		return fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
+	}
+	return nil
+}
 
 // executeWithRetry 带重试的Execute，超时错误会重试
 func executeWithRetry(nsid, gql string) (interface{}, interface{}, error) {
@@ -41,15 +62,16 @@ func executeWithRetry(nsid, gql string) (interface{}, interface{}, error) {
 
 // dropSpaceIfExists 检查并删除 space
 func dropSpaceIfExists(nsid string, spaceName string) error {
-	result, _, err := dao.Execute(nsid, "SHOW SPACES", nil)
+	gql := "SHOW SPACES"
+	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 
 	for _, row := range result.Tables {
 		if name, ok := row["Name"].(string); ok && name == spaceName {
-			_, _, err := dao.Execute(nsid, fmt.Sprintf("DROP SPACE %s", spaceName), nil)
-			if err != nil {
+			gql := fmt.Sprintf("DROP SPACE %s", spaceName)
+			if err := executeWithGqlError(nsid, gql); err != nil {
 				return err
 			}
 			logs.Info("Dropped existing space: %s", spaceName)
@@ -62,7 +84,8 @@ func dropSpaceIfExists(nsid string, spaceName string) error {
 const defaultBatchSize = 1000
 
 // CopySpace copies all data from srcSpace to dstSpace
-func CopySpace(nsid, srcSpace, dstSpace string, force bool, partitionNum, replicaFactor int, vidType string) error {
+func CopySpace(ctx context.Context, nsid, srcSpace, dstSpace string, force bool, partitionNum, replicaFactor int, vidType string, debug bool) error {
+	ctx = context.WithValue(ctx, debugContextKey, debug)
 	logs.Info("Starting to copy space from %s to %s (force=%v, partition_num=%v, replica_factor=%v)", srcSpace, dstSpace, force, partitionNum, replicaFactor)
 	// 如果 force 为 true，先检查并删除已存在的 space
 	if force {
@@ -71,7 +94,7 @@ func CopySpace(nsid, srcSpace, dstSpace string, force bool, partitionNum, replic
 		}
 	}
 
-	err := createSpace(nsid, srcSpace, dstSpace, partitionNum, replicaFactor, vidType)
+	err := createSpace(ctx, nsid, srcSpace, dstSpace, partitionNum, replicaFactor, vidType)
 	if err != nil {
 		return fmt.Errorf("failed to create space: %v", err)
 	}
@@ -84,17 +107,17 @@ func CopySpace(nsid, srcSpace, dstSpace string, force bool, partitionNum, replic
 	}
 	logs.Info("Space is ready")
 
-	err = createIndexes(nsid, srcSpace, dstSpace)
+	err = createIndexes(ctx, nsid, srcSpace, dstSpace)
 	if err != nil {
 		return fmt.Errorf("failed to create indexes: %v", err)
 	}
 
-	haveListeners, err := copyListeners(nsid, srcSpace, dstSpace)
+	haveListeners, err := copyListeners(ctx, nsid, srcSpace, dstSpace)
 	if err != nil {
 		return fmt.Errorf("failed to copy listeners: %w", err)
 	}
 	if haveListeners {
-		if err := copyFulltextIndexes(nsid, srcSpace, dstSpace); err != nil {
+		if err := copyFulltextIndexes(ctx, nsid, srcSpace, dstSpace); err != nil {
 			return fmt.Errorf("failed to copy fulltext indexes: %w", err)
 		}
 	}
@@ -109,12 +132,12 @@ func CopySpace(nsid, srcSpace, dstSpace string, force bool, partitionNum, replic
 		return fmt.Errorf("failed to get edges: %v", err)
 	}
 
-	err = copyVertices(nsid, srcSpace, dstSpace, tags)
+	err = copyVertices(ctx, nsid, srcSpace, dstSpace, tags)
 	if err != nil {
 		return fmt.Errorf("failed to copy vertices: %v", err)
 	}
 
-	err = copyEdges(nsid, srcSpace, dstSpace, edges)
+	err = copyEdges(ctx, nsid, srcSpace, dstSpace, edges)
 	if err != nil {
 		return fmt.Errorf("failed to copy edges: %v", err)
 	}
@@ -122,6 +145,7 @@ func CopySpace(nsid, srcSpace, dstSpace string, force bool, partitionNum, replic
 	// 执行负载均衡
 	logs.Info("Submitting job to balance leader distribution...")
 	balanceGql := fmt.Sprintf("USE %s; SUBMIT JOB BALANCE LEADER", dstSpace)
+	debugLogCtx(ctx, balanceGql)
 	_, _, err = dao.Execute(nsid, balanceGql, nil)
 	if err != nil {
 		logs.Warn("Balance leader job submission failed: %v", err)
@@ -156,13 +180,13 @@ func waitForSpaceReady(nsid, spaceName string) error {
 	return fmt.Errorf("space %s not ready after %d seconds", spaceName, maxRetries)
 }
 
-func createSpace(nsid, srcSpace, dstSpace string, partitionNum, replicaFactor int, vidType string) error {
+func createSpace(ctx context.Context, nsid, srcSpace, dstSpace string, partitionNum, replicaFactor int, vidType string) error {
 	// 判断使用哪种流程
 	if partitionNum == 0 && replicaFactor == 0 && vidType == "" {
 		// 原流程: CREATE SPACE dstSpace AS srcSpace
 		gql := fmt.Sprintf("CREATE SPACE %s AS %s", dstSpace, srcSpace)
-		_, _, err := dao.Execute(nsid, gql, nil)
-		return err
+		debugLogCtx(ctx, gql)
+		return executeWithGqlError(nsid, gql)
 	}
 
 	// 新流程: 获取源 space 元数据并构建完整 CREATE SPACE 语句
@@ -173,18 +197,18 @@ func createSpace(nsid, srcSpace, dstSpace string, partitionNum, replicaFactor in
 
 	// 构建 CREATE SPACE 语句
 	gql := buildCreateSpaceGql(dstSpace, desc, partitionNum, replicaFactor, vidType)
-	_, _, err = dao.Execute(nsid, gql, nil)
-	if err != nil {
+	debugLogCtx(ctx, gql)
+	if err := executeWithGqlError(nsid, gql); err != nil {
 		return fmt.Errorf("failed to create space: %w", err)
 	}
 
 	// 复制 tag schema
-	if err := copyTagsAdvanced(nsid, srcSpace, dstSpace); err != nil {
+	if err := copyTagsAdvanced(ctx, nsid, srcSpace, dstSpace); err != nil {
 		return fmt.Errorf("failed to copy tags: %w", err)
 	}
 
 	// 复制 edge schema
-	if err := copyEdgesAdvanced(nsid, srcSpace, dstSpace); err != nil {
+	if err := copyEdgesAdvanced(ctx, nsid, srcSpace, dstSpace); err != nil {
 		return fmt.Errorf("failed to copy edges: %w", err)
 	}
 
@@ -272,11 +296,11 @@ func buildCreateSpaceGql(dstSpace string, desc *SpaceDesc, partitionNum, replica
 }
 
 // copyTagsAdvanced 逐个复制 tag schema
-func copyTagsAdvanced(nsid, srcSpace, dstSpace string) error {
+func copyTagsAdvanced(ctx context.Context, nsid, srcSpace, dstSpace string) error {
 	gql := fmt.Sprintf("USE %s; SHOW TAGS", srcSpace)
 	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 
 	for _, row := range result.Tables {
@@ -301,7 +325,10 @@ func copyTagsAdvanced(nsid, srcSpace, dstSpace string) error {
 			}
 
 			execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
-			dao.Execute(nsid, execGql, nil)
+			debugLogCtx(ctx, execGql)
+			if err := executeWithGqlError(nsid, execGql); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -309,11 +336,11 @@ func copyTagsAdvanced(nsid, srcSpace, dstSpace string) error {
 }
 
 // copyEdgesAdvanced 逐个复制 edge schema
-func copyEdgesAdvanced(nsid, srcSpace, dstSpace string) error {
+func copyEdgesAdvanced(ctx context.Context, nsid, srcSpace, dstSpace string) error {
 	gql := fmt.Sprintf("USE %s; SHOW EDGES", srcSpace)
 	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 
 	for _, row := range result.Tables {
@@ -338,7 +365,10 @@ func copyEdgesAdvanced(nsid, srcSpace, dstSpace string) error {
 			}
 
 			execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
-			dao.Execute(nsid, execGql, nil)
+			debugLogCtx(ctx, execGql)
+			if err := executeWithGqlError(nsid, execGql); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -349,7 +379,7 @@ func getTags(nsid, space string) ([]string, error) {
 	gql := fmt.Sprintf("USE %s; SHOW TAGS", space)
 	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 	var tags []string
 	for _, row := range result.Tables {
@@ -364,7 +394,7 @@ func getEdges(nsid, space string) ([]string, error) {
 	gql := fmt.Sprintf("USE %s; SHOW EDGES", space)
 	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 	var edges []string
 	for _, row := range result.Tables {
@@ -376,9 +406,10 @@ func getEdges(nsid, space string) ([]string, error) {
 }
 
 func getSpaceID(nsid, spaceName string) (int64, error) {
-	result, _, err := dao.Execute(nsid, fmt.Sprintf("DESCRIBE SPACE %s", spaceName), nil)
+	gql := fmt.Sprintf("DESCRIBE SPACE %s", spaceName)
+	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 
 	for _, row := range result.Tables {
@@ -390,156 +421,134 @@ func getSpaceID(nsid, spaceName string) (int64, error) {
 }
 
 // copyFulltextIndexes 复制全文本索引到新 space
-func copyFulltextIndexes(nsid, srcSpace, dstSpace string) error {
+func copyFulltextIndexes(ctx context.Context, nsid, srcSpace, dstSpace string) error {
 	// 1. 获取 dstSpace 的 ID
 	dstSpaceID, err := getSpaceID(nsid, dstSpace)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get dst space ID: %w", err)
 	}
 
-	// 2. 获取源 space 的全文本索引配置
+	// 2. 在原 space 获取全文本索引信息
 	gql := fmt.Sprintf("USE %s; SHOW FULLTEXT INDEXES", srcSpace)
 	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 
 	if len(result.Tables) == 0 {
-		logs.Info("No fulltext indexes found in source space")
+		logs.Info("[DEBUG] No fulltext indexes found in source space")
 		return nil
 	}
 
+	// 3. 解析并创建全文本索引
 	for _, row := range result.Tables {
-		var newIndexName string
-		if indexName, ok := row["Name"].(string); ok {
-			// 为索引名添加 space ID 后缀以避免冲突
-			newIndexName = fmt.Sprintf("%s_%d", indexName, dstSpaceID)
+		indexName, _ := row["Name"].(string)
+		schemaType, _ := row["Schema Type"].(string) // Tag 或 Edge
+		schemaName, _ := row["Schema Name"].(string)
+		fields, _ := row["Fields"].(string)
+		analyzer, _ := row["Analyzer"].(string)
 
-			// 获取原索引的创建语句
-			descGql := fmt.Sprintf("USE %s; SHOW CREATE TAG INDEX %s", srcSpace, indexName)
-			descResult, _, err := dao.Execute(nsid, descGql, nil)
-			if err != nil {
-				logs.Warn("Failed to get fulltext index %s: %v", indexName, err)
-				continue
-			}
+		if indexName == "" || schemaName == "" || fields == "" {
+			continue
+		}
 
-			if len(descResult.Tables) == 0 {
-				continue
-			}
+		// 在索引名后加上 space ID 避免冲突
+		newIndexName := fmt.Sprintf("%s_%d", indexName, dstSpaceID)
 
-			// 解析创建语句
-			var createStmt string
-			for _, col := range descResult.Headers {
-				if strings.Contains(col, "Create") {
-					if stmt, ok := descResult.Tables[0][col].(string); ok {
-						createStmt = stmt
-						break
-					}
-				}
-			}
+		// 4. 生成 CREATE FULLTEXT INDEX nGQL
+		var createGql string
+		if schemaType == "Tag" {
+			createGql = fmt.Sprintf("CREATE FULLTEXT TAG INDEX %s ON %s(%s) ANALYZER=\"%s\"",
+				newIndexName, schemaName, fields, analyzer)
+		} else if schemaType == "Edge" {
+			createGql = fmt.Sprintf("CREATE FULLTEXT EDGE INDEX %s ON %s(%s) ANALYZER=\"%s\"",
+				newIndexName, schemaName, fields, analyzer)
+		} else {
+			continue
+		}
 
-			if createStmt == "" {
-				continue
-			}
+		fullGql := fmt.Sprintf("USE %s; %s", dstSpace, createGql)
+		debugLogCtx(ctx, fullGql)
 
-			// 修改索引名
-			newCreateStmt := strings.Replace(createStmt, indexName, newIndexName, 1)
+		logs.Info("[DEBUG] Creating fulltext index: %s (original: %s)", newIndexName, indexName)
 
-			logs.Info("Creating fulltext index: %s (original: %s)", newIndexName, indexName)
-
-			// 在目标 space 创建索引
-			execGql := fmt.Sprintf("USE %s; %s", dstSpace, newCreateStmt)
-			if _, _, err := dao.Execute(nsid, execGql, nil); err != nil {
-				logs.Warn("Failed to create fulltext index %s: %v", newIndexName, err)
-			}
+		if err := executeWithGqlError(nsid, fullGql); err != nil {
+			return fmt.Errorf("create fulltext index %s failed: %w", newIndexName, err)
 		}
 	}
 
-	logs.Info("Fulltext indexes copied successfully")
+	logs.Info("[DEBUG] Fulltext indexes copied successfully")
 	return nil
 }
 
-// copyFulltextIndex 复制单个全文本索引
-func copyFulltextIndex(nsid, srcSpace, dstSpace string, indexName string) error {
-	// 获取原索引的创建语句
-	descGql := fmt.Sprintf("USE %s; SHOW CREATE TAG INDEX %s", srcSpace, indexName)
-	result, _, err := dao.Execute(nsid, descGql, nil)
-	if err != nil || len(result.Tables) == 0 {
-		return err
-	}
-
-	// 解析创建语句
-	var createStmt string
-	for _, col := range result.Headers {
-		if strings.Contains(col, "Create") {
-			if stmt, ok := result.Tables[0][col].(string); ok {
-				createStmt = stmt
-				break
-			}
-		}
-	}
-
-	if createStmt == "" {
-		return fmt.Errorf("cannot find create statement for index %s", indexName)
-	}
-
-	// 在目标 space 创建索引
-	execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
-	_, _, err = dao.Execute(nsid, execGql, nil)
-	return err
-}
-
-func copyListeners(nsid, srcSpace, dstSpace string) (bool, error) {
-	// 获取 listener 配置
-	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW LISTENER", srcSpace), nil)
+// copyListeners 复制 LISTENER 配置到新 space
+func copyListeners(ctx context.Context, nsid, srcSpace, dstSpace string) (bool, error) {
+	// 1. 在原 space 获取 LISTENER 信息
+	gql := fmt.Sprintf("USE %s; SHOW LISTENER", srcSpace)
+	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 
 	if len(result.Tables) == 0 {
-		logs.Info("No listeners found in source space")
+		logs.Info("[DEBUG] No listeners found in source space")
 		return false, nil
 	}
 
+	// 2. 提取 ELASTICSEARCH 类型的 Host
+	var hosts []string
 	for _, row := range result.Tables {
-		if listenerType, ok := row["Type"].(string); ok {
+		if listenerType, ok := row["Type"].(string); ok && listenerType == "ELASTICSEARCH" {
 			if host, ok := row["Host"].(string); ok {
-				// 构建创建 listener 的语句
-				// 格式: CREATE LISTENER ELASTICSEARCH ON SPACE xxx TO "http://host:port"
-				listenerGql := fmt.Sprintf("USE %s; CREATE LISTENER %s ON %s TO \"%s\"",
-					dstSpace, listenerType, dstSpace, host)
-				_, _, err := dao.Execute(nsid, listenerGql, nil)
-				if err != nil {
-					logs.Warn("Failed to create listener: %v", err)
-				}
+				hosts = append(hosts, host)
 			}
 		}
 	}
 
+	if len(hosts) == 0 {
+		logs.Info("No ELASTICSEARCH listeners found")
+		return false, nil
+	}
+
+	// 3. 生成 ADD LISTENER nGQL 并执行
+	hostsStr := strings.Join(hosts, ",")
+	addListenerGql := fmt.Sprintf("ADD LISTENER ELASTICSEARCH %s", hostsStr)
+	fullGql := fmt.Sprintf("USE %s; %s", dstSpace, addListenerGql)
+
+	logs.Info("Copying listener: %s", addListenerGql)
+	debugLogCtx(ctx, fullGql)
+
+	_, _, err = dao.Execute(nsid, fullGql, nil)
+	if err != nil {
+		return false, fmt.Errorf("add listener failed: %w", err)
+	}
+
+	logs.Info("Listener copied successfully")
 	return true, nil
 }
 
-func createIndexes(nsid, srcSpace, dstSpace string) error {
+func createIndexes(ctx context.Context, nsid, srcSpace, dstSpace string) error {
 	tagIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW TAG INDEXES", srcSpace), nil)
 	edgeIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW EDGE INDEXES", srcSpace), nil)
 
 	for _, row := range tagIndexResult.Tables {
 		if indexName, ok := row["Index Name"].(string); ok {
-			createTagIndex(nsid, srcSpace, dstSpace, indexName)
+			createTagIndex(ctx, nsid, srcSpace, dstSpace, indexName)
 		}
 	}
 	for _, row := range edgeIndexResult.Tables {
 		if indexName, ok := row["Index Name"].(string); ok {
-			createEdgeIndex(nsid, srcSpace, dstSpace, indexName)
+			createEdgeIndex(ctx, nsid, srcSpace, dstSpace, indexName)
 		}
 	}
 	return nil
 }
 
-func createTagIndex(nsid, srcSpace, dstSpace, indexName string) error {
-	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW CREATE TAG INDEX %s", srcSpace, indexName), nil)
+func createTagIndex(ctx context.Context, nsid, srcSpace, dstSpace, indexName string) error {
+	gql := fmt.Sprintf("USE %s; SHOW CREATE TAG INDEX %s", srcSpace, indexName)
+	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil || len(result.Tables) == 0 {
-		return err
+		return fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 	row := result.Tables[0]
 	var createStmt string
@@ -554,14 +563,16 @@ func createTagIndex(nsid, srcSpace, dstSpace, indexName string) error {
 	if createStmt == "" {
 		return fmt.Errorf("cannot find create statement for index %s", indexName)
 	}
-	_, _, err = dao.Execute(nsid, fmt.Sprintf("USE %s; %s", dstSpace, createStmt), nil)
-	return err
+	execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
+	debugLogCtx(ctx, execGql)
+	return executeWithGqlError(nsid, execGql)
 }
 
-func createEdgeIndex(nsid, srcSpace, dstSpace, indexName string) error {
-	result, _, err := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW CREATE EDGE INDEX %s", srcSpace, indexName), nil)
+func createEdgeIndex(ctx context.Context, nsid, srcSpace, dstSpace, indexName string) error {
+	gql := fmt.Sprintf("USE %s; SHOW CREATE EDGE INDEX %s", srcSpace, indexName)
+	result, _, err := dao.Execute(nsid, gql, nil)
 	if err != nil || len(result.Tables) == 0 {
-		return err
+		return fmt.Errorf("execute GQL failed, gql: %s, error: %w", gql, err)
 	}
 	row := result.Tables[0]
 	var createStmt string
@@ -576,11 +587,12 @@ func createEdgeIndex(nsid, srcSpace, dstSpace, indexName string) error {
 	if createStmt == "" {
 		return fmt.Errorf("cannot find create statement for index %s", indexName)
 	}
-	_, _, err = dao.Execute(nsid, fmt.Sprintf("USE %s; %s", dstSpace, createStmt), nil)
-	return err
+	execGql := fmt.Sprintf("USE %s; %s", dstSpace, createStmt)
+	debugLogCtx(ctx, execGql)
+	return executeWithGqlError(nsid, execGql)
 }
 
-func copyVertices(nsid, srcSpace, dstSpace string, tags []string) error {
+func copyVertices(ctx context.Context, nsid, srcSpace, dstSpace string, tags []string) error {
 	for _, tag := range tags {
 		logs.Info("Copying vertices for tag: %s", tag)
 		scanner, err := NewStorageScanner(nsid, srcSpace)
@@ -593,7 +605,7 @@ func copyVertices(nsid, srcSpace, dstSpace string, tags []string) error {
 		err = scanner.ScanVertices(tag, defaultBatchSize, func(vertices []map[string]interface{}) error {
 			logs.Info("Scanned %d vertices for tag %s", len(vertices), tag)
 			// 批量插入到目标 space
-			if err := insertVertexBatch(nsid, dstSpace, tag, vertices); err != nil {
+			if err := insertVertexBatch(ctx, nsid, dstSpace, tag, vertices); err != nil {
 				logs.Error("Insert vertex failed: %v", err)
 				return err
 			}
@@ -606,7 +618,7 @@ func copyVertices(nsid, srcSpace, dstSpace string, tags []string) error {
 	return nil
 }
 
-func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interface{}) error {
+func insertVertexBatch(ctx context.Context, nsid, dstSpace, tag string, vertices []map[string]interface{}) error {
 	if len(vertices) == 0 {
 		return nil
 	}
@@ -662,7 +674,7 @@ func insertVertexBatch(nsid, dstSpace, tag string, vertices []map[string]interfa
 		insertGql = fmt.Sprintf("USE %s; INSERT VERTEX %s(%s) VALUES %s", dstSpace, tag, strings.Join(props, ", "), strings.Join(values, ", "))
 	}
 
-	logs.Info("Insert vertex GQL: %s", insertGql)
+	debugLogCtx(ctx, insertGql)
 	_, _, err := executeWithRetry(nsid, insertGql)
 	if err != nil {
 		logs.Error("Insert vertex failed: %v", err)
@@ -715,7 +727,7 @@ func escapeString(s string) string {
 	return s
 }
 
-func copyEdges(nsid, srcSpace, dstSpace string, edges []string) error {
+func copyEdges(ctx context.Context, nsid, srcSpace, dstSpace string, edges []string) error {
 
 	for _, edge := range edges {
 		logs.Info("Copying edges for type: %s", edge)
@@ -729,7 +741,7 @@ func copyEdges(nsid, srcSpace, dstSpace string, edges []string) error {
 		err = scanner.ScanEdges(edge, defaultBatchSize, func(edges []map[string]interface{}) error {
 			logs.Info("Scanned %d edges for type %s", len(edges), edge)
 			// 批量插入到目标 space
-			if err := insertEdgeBatch(nsid, dstSpace, edge, edges); err != nil {
+			if err := insertEdgeBatch(ctx, nsid, dstSpace, edge, edges); err != nil {
 				logs.Error("Insert edge failed: %v", err)
 				return err
 			}
@@ -742,7 +754,7 @@ func copyEdges(nsid, srcSpace, dstSpace string, edges []string) error {
 	return nil
 }
 
-func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}) error {
+func insertEdgeBatch(ctx context.Context, nsid, dstSpace, edge string, edges []map[string]interface{}) error {
 	if len(edges) == 0 {
 		return nil
 	}
@@ -825,7 +837,7 @@ func insertEdgeBatch(nsid, dstSpace, edge string, edges []map[string]interface{}
 		insertGql = fmt.Sprintf("USE %s; INSERT EDGE %s(%s) VALUES %s", dstSpace, edge, strings.Join(props, ", "), strings.Join(values, ", "))
 	}
 
-	logs.Info("Insert edge GQL: %s", insertGql)
+	debugLogCtx(ctx, insertGql)
 	_, _, err := executeWithRetry(nsid, insertGql)
 	if err != nil {
 		logs.Error("Insert edge failed: %v", err)

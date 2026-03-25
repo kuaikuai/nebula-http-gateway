@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -34,6 +35,7 @@ type CopyRequest struct {
 	PartitionNum  int    `json:"partition_num"`
 	ReplicaFactor int    `json:"replica_factor"`
 	VidType       string `json:"vid_type"`
+	Debug         bool   `json:"debug"`
 }
 
 func (this *TaskController) Import() {
@@ -126,7 +128,8 @@ func (this *TaskController) Copy() {
 
 	// Start async copy in goroutine
 	go func() {
-		err := copier.CopySpace(nsid.(string), params.SrcSpace, params.DstSpace, params.Force, params.PartitionNum, params.ReplicaFactor, params.VidType)
+		ctx := context.Background()
+		err := copier.CopySpace(ctx, nsid.(string), params.SrcSpace, params.DstSpace, params.Force, params.PartitionNum, params.ReplicaFactor, params.VidType, params.Debug)
 		if err != nil {
 			logs.Error(fmt.Sprintf("Failed to copy space: `%s` -> `%s`, error: `%v`", params.SrcSpace, params.DstSpace, err))
 			task.TaskStatus = importer.StatusAborted.String()
