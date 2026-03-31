@@ -153,25 +153,36 @@ func (s *StorageScanner) getSpaceID(spaceName string) (nebula.GraphSpaceID, erro
 }
 
 func (s *StorageScanner) getTagID(tagName string) (nebula.TagID, error) {
-	explainGql := fmt.Sprintf("EXPLAIN format='row' MATCH (n:%s) RETURN n LIMIT 1", tagName)
-	result, _, err := dao.Execute(s.nsid, explainGql, nil)
-	if err != nil {
-		return 0, err
-	}
-	for _, row := range result.Tables {
-		if opName, ok := row["name"].(string); ok {
-			if opName == "ScanVertices" {
-				if opInfo, ok := row["operator info"].(string); ok {
-					if tagID, found := extractTagID(opInfo); found {
-						return nebula.TagID(tagID), nil
+	maxRetries := 10
+	retryInterval := 5 * time.Second
+
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		explainGql := fmt.Sprintf("EXPLAIN format='row' MATCH (n:%s) RETURN n LIMIT 1", tagName)
+		result, _, err := dao.Execute(s.nsid, explainGql, nil)
+		if err != nil {
+			lastErr = err
+			logs.Warn("getTagID attempt %d/%d failed: %v", i+1, maxRetries, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+		for _, row := range result.Tables {
+			if opName, ok := row["name"].(string); ok {
+				if opName == "ScanVertices" {
+					if opInfo, ok := row["operator info"].(string); ok {
+						if tagID, found := extractTagID(opInfo); found {
+							return nebula.TagID(tagID), nil
+						}
 					}
 				}
 			}
 		}
+		lastErr = fmt.Errorf("tag ID not found for %s, result tables:%v", tagName, result.Tables)
+		logs.Warn("getTagID attempt %d/%d: %v", i+1, maxRetries, lastErr)
+		time.Sleep(retryInterval)
 	}
 
-	return 0, fmt.Errorf("tag ID not found for %s, result tables:%v",
-		tagName, result.Tables)
+	return 0, fmt.Errorf("tag ID not found for %s after %d attempts: %w", tagName, maxRetries, lastErr)
 }
 
 func extractTagID(opInfo string) (int64, bool) {
@@ -199,25 +210,36 @@ func extractTagID(opInfo string) (int64, bool) {
 }
 
 func (s *StorageScanner) getEdgeID(edgeName string) (nebula.EdgeType, error) {
-	explainGql := fmt.Sprintf("EXPLAIN format='row' MATCH (a)-[r:%s]->(b) RETURN r LIMIT 1", edgeName)
-	result, _, err := dao.Execute(s.nsid, explainGql, nil)
-	if err != nil {
-		return 0, err
-	}
-	for _, row := range result.Tables {
-		if opName, ok := row["name"].(string); ok {
-			if opName == "Traverse" {
-				if opInfo, ok := row["operator info"].(string); ok {
-					if edgeTypeID, found := extractEdgeTypeID(opInfo); found {
-						return nebula.EdgeType(edgeTypeID), nil
+	maxRetries := 10
+	retryInterval := 5 * time.Second
+
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		explainGql := fmt.Sprintf("EXPLAIN format='row' MATCH (a)-[r:%s]->(b) RETURN r LIMIT 1", edgeName)
+		result, _, err := dao.Execute(s.nsid, explainGql, nil)
+		if err != nil {
+			lastErr = err
+			logs.Warn("getEdgeID attempt %d/%d failed: %v", i+1, maxRetries, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+		for _, row := range result.Tables {
+			if opName, ok := row["name"].(string); ok {
+				if opName == "Traverse" {
+					if opInfo, ok := row["operator info"].(string); ok {
+						if edgeTypeID, found := extractEdgeTypeID(opInfo); found {
+							return nebula.EdgeType(edgeTypeID), nil
+						}
 					}
 				}
 			}
 		}
+		lastErr = fmt.Errorf("edge ID not found for %s, result tables:%v", edgeName, result.Tables)
+		logs.Warn("getEdgeID attempt %d/%d: %v", i+1, maxRetries, lastErr)
+		time.Sleep(retryInterval)
 	}
 
-	return 0, fmt.Errorf("edge ID not found for %s, result tables:%v",
-		edgeName, result.Tables)
+	return 0, fmt.Errorf("edge ID not found for %s after %d attempts: %w", edgeName, maxRetries, lastErr)
 }
 
 // getEdgeProps 获取 edge 的所有属性名

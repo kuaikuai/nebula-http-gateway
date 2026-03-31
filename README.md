@@ -39,6 +39,10 @@ $ ./nebula-httpd
 | connect    | /api/db/connect    | POST   |
 | exec       | /api/db/exec       | POST   |
 | disconnect | /api/db/disconnect | POST   |
+| import     | /api/task/import   | POST   |
+| action     | /api/task/import/action | POST |
+| copy       | /api/task/copy     | POST   |
+| sync-es    | /api/task/sync-es  | POST   |
 
 #### Connect API ####
 
@@ -225,4 +229,135 @@ response:
   "message": "Processing a task action successfully"
 }
 ```
+
+#### Copy Space API ####
+
+The Copy Space API copies all data from a source space to a destination space, including tags, edges, indexes, listeners, and full-text indexes.
+
+The requested json body
+
+```json
+{
+  "src_space": "nba",
+  "dst_space": "nba_copy",
+  "force": true,
+  "partition_num": 0,
+  "replica_factor": 0,
+  "vid_type": "",
+  "debug": false,
+  "batch_size": 1000
+}
+```
+
+The description of the parameters is as follows.
+
+| Field         | Description                                                                                              |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| src_space     | The name of the source space to copy from.                                                               |
+| dst_space     | The name of the destination space to copy to.                                                            |
+| force         | If true, the destination space will be dropped first if it exists.                                       |
+| partition_num | The number of partitions for the destination space. If 0, uses the source space's partition count.    |
+| replica_factor| The replica factor for the destination space. If 0, uses the source space's replica factor.             |
+| vid_type      | The VID type for the destination space (e.g., "INT64", "FIXED_STRING(8)"). If empty, uses source type. |
+| debug         | If true, outputs debug nGQL statements to logs.                                                         |
+| batch_size    | The batch size for scanning and inserting data. If 0, uses the configured default (copyBatchSize).      |
+
+```bash
+$ curl -X POST \
+    -H "Cookie: SameSite=None; common-nsid=bec2e665ba62a13554b617d70de8b9b9" \
+    -d '{"src_space": "nba", "dst_space": "nba_copy", "force": true}' \
+    http://127.0.0.1:8080/api/task/copy
+```
+
+response:
+
+```json
+{
+  "code": 0,
+  "data": ["task_id_12345"],
+  "message": "Copy task task_id_12345 submit successfully"
+}
+```
+
+You can query the task status using the Action API:
+
+```bash
+$ curl -X POST -d '{"taskID": "task_id_12345", "taskAction": "actionQuery"}' http://127.0.0.1:8080/api/task/import/action
+```
+
+**Configuration:**
+
+The default batch size can be configured in `conf/app.conf`:
+
+```conf
+copyBatchSize = 1000
+```
+
+#### Sync ES API ####
+
+The Sync ES API synchronizes data from NebulaGraph to Elasticsearch full-text indexes. It scans vertices or edges using `scanVertices`/`scanEdges` and writes to the specified ES index.
+
+**Prerequisites:**
+
+1. Elasticsearch must be configured as a text search client in NebulaGraph
+2. A full-text index must exist in NebulaGraph (created via `CREATE FULLTEXT INDEX`)
+3. The ES index name must match the NebulaGraph full-text index name
+
+The requested json body
+
+```json
+{
+  "space": "nba",
+  "es_index": "player_idx",
+  "batch_size": 1000,
+  "es_username": "elastic",
+  "es_password": "password"
+}
+```
+
+The description of the parameters is as follows.
+
+| Field        | Description                                                                                          |
+| ------------ | ---------------------------------------------------------------------------------------------------- |
+| space        | The NebulaGraph space name to sync from.                                                             |
+| es_index     | The ES index name (must match a NebulaGraph full-text index name).                                 |
+| batch_size   | The batch size for bulk写入 ES. If 0, uses default 1000.                                            |
+| es_username  | Elasticsearch username for authentication (optional if ES has no auth).                             |
+| es_password  | Elasticsearch password for authentication (optional if ES has no auth).                            |
+
+```bash
+$ curl -X POST \
+    -H "Cookie: SameSite=None; common-nsid=bec2e665ba62a13554b617d70de8b9b9" \
+    -d '{"space": "nba", "es_index": "player_idx"}' \
+    http://127.0.0.1:8080/api/task/sync-es
+```
+
+response:
+
+```json
+{
+  "code": 0,
+  "data": {
+    "task_id": "task_id_67890"
+  },
+  "message": "Sync task task_id_67890 submitted successfully"
+}
+```
+
+**How it works:**
+
+1. Queries `SHOW TEXT SEARCH CLIENTS` to discover ES cluster addresses
+2. Queries `SHOW FULLTEXT INDEXES` to get the index field mappings
+3. If the index is on a **Tag**: uses `scanVertices` to traverse and write to ES
+4. If the index is on an **Edge**: uses `scanEdges` to traverse and write to ES
+5. Filters properties to only include fields defined in the full-text index
+6. Generates doc IDs using SHA256 hash (matching NebulaGraph's official format)
+
+**Use cases:**
+
+- Rebuild ES index after data loss
+- One-time migration of NebulaGraph data to ES
+- Periodic data synchronization
+
+**Note:** This API performs one-way sync from NebulaGraph to ES. It does not keep ES in real-time sync.
 
