@@ -37,6 +37,7 @@ type CopyRequest struct {
 	ReplicaFactor int    `json:"replica_factor"`
 	VidType       string `json:"vid_type"`
 	Debug         bool   `json:"debug"`
+	BatchSize     int    `json:"batch_size"`
 }
 
 type SyncESRequest struct {
@@ -138,7 +139,11 @@ func (this *TaskController) Copy() {
 	// Start async copy in goroutine
 	go func() {
 		ctx := context.Background()
-		err := copier.CopySpace(ctx, nsid.(string), params.SrcSpace, params.DstSpace, params.Force, params.PartitionNum, params.ReplicaFactor, params.VidType, params.Debug)
+		batchSize := params.BatchSize
+		if batchSize <= 0 {
+			batchSize = beego.AppConfig.DefaultInt("copyBatchSize", 1000)
+		}
+		err := copier.CopySpace(ctx, nsid.(string), params.SrcSpace, params.DstSpace, params.Force, params.PartitionNum, params.ReplicaFactor, params.VidType, params.Debug, batchSize)
 		if err != nil {
 			logs.Error(fmt.Sprintf("Failed to copy space: `%s` -> `%s`, error: `%v`", params.SrcSpace, params.DstSpace, err))
 			task.TaskStatus = importer.StatusAborted.String()

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/logs"
 	"github.com/vesoft-inc/nebula-http-gateway/ccore/nebula/gateway/dao"
 )
@@ -14,6 +15,8 @@ const (
 	maxRetries    = 6
 	retryInterval = 5 * time.Second
 )
+
+var defaultBatchSize = beego.AppConfig.DefaultInt("copyBatchSize", 1000)
 
 type contextKey string
 
@@ -81,12 +84,14 @@ func dropSpaceIfExists(nsid string, spaceName string) error {
 	return nil
 }
 
-const defaultBatchSize = 1000
-
 // CopySpace copies all data from srcSpace to dstSpace
-func CopySpace(ctx context.Context, nsid, srcSpace, dstSpace string, force bool, partitionNum, replicaFactor int, vidType string, debug bool) error {
+func CopySpace(ctx context.Context, nsid, srcSpace, dstSpace string, force bool, partitionNum, replicaFactor int, vidType string, debug bool, batchSize int) error {
+	// 如果未指定 batchSize，使用配置文件中的默认值
+	if batchSize <= 0 {
+		batchSize = defaultBatchSize
+	}
 	ctx = context.WithValue(ctx, debugContextKey, debug)
-	logs.Info("Starting to copy space from %s to %s (force=%v, partition_num=%v, replica_factor=%v)", srcSpace, dstSpace, force, partitionNum, replicaFactor)
+	logs.Info("Starting to copy space from %s to %s (force=%v, partition_num=%v, replica_factor=%v, batch_size=%d)", srcSpace, dstSpace, force, partitionNum, replicaFactor, batchSize)
 	// 如果 force 为 true，先检查并删除已存在的 space
 	if force {
 		if err := dropSpaceIfExists(nsid, dstSpace); err != nil {
@@ -98,14 +103,6 @@ func CopySpace(ctx context.Context, nsid, srcSpace, dstSpace string, force bool,
 	if err != nil {
 		return fmt.Errorf("failed to create space: %v", err)
 	}
-
-	// Wait for space to be ready (metadata sync)
-	logs.Info("Waiting for space to be ready...")
-	err = waitForSpaceReady(nsid, dstSpace)
-	if err != nil {
-		return fmt.Errorf("space not ready: %v", err)
-	}
-	logs.Info("Space is ready")
 
 	err = createIndexes(ctx, nsid, srcSpace, dstSpace)
 	if err != nil {
@@ -132,12 +129,12 @@ func CopySpace(ctx context.Context, nsid, srcSpace, dstSpace string, force bool,
 		return fmt.Errorf("failed to get edges: %v", err)
 	}
 
-	err = copyVertices(ctx, nsid, srcSpace, dstSpace, tags)
+	err = copyVertices(ctx, nsid, srcSpace, dstSpace, tags, batchSize)
 	if err != nil {
 		return fmt.Errorf("failed to copy vertices: %v", err)
 	}
 
-	err = copyEdges(ctx, nsid, srcSpace, dstSpace, edges)
+	err = copyEdges(ctx, nsid, srcSpace, dstSpace, edges, batchSize)
 	if err != nil {
 		return fmt.Errorf("failed to copy edges: %v", err)
 	}
@@ -165,17 +162,11 @@ func waitForSpaceReady(nsid, spaceName string) error {
 
 	for i := 0; i < maxRetries; i++ {
 		time.Sleep(retryInterval)
-		result, _, err := dao.Execute(nsid, "SHOW SPACES", nil)
-		if err != nil {
-			continue
+		err := executeWithGqlError(nsid, fmt.Sprintf("USE %s", spaceName))
+		if err == nil {
+			return nil
 		}
-		for _, row := range result.Tables {
-			if name, ok := row["Name"].(string); ok {
-				if name == spaceName {
-					return nil // Space is ready
-				}
-			}
-		}
+		logs.Warn("Space %s not ready yet, retrying %d/%d...: %v", spaceName, i+1, maxRetries, err)
 	}
 	return fmt.Errorf("space %s not ready after %d seconds", spaceName, maxRetries)
 }
@@ -186,7 +177,11 @@ func createSpace(ctx context.Context, nsid, srcSpace, dstSpace string, partition
 		// 原流程: CREATE SPACE dstSpace AS srcSpace
 		gql := fmt.Sprintf("CREATE SPACE %s AS %s", dstSpace, srcSpace)
 		debugLogCtx(ctx, gql)
-		return executeWithGqlError(nsid, gql)
+		err := executeWithGqlError(nsid, gql)
+		if err != nil {
+			return err
+		}
+		return waitForSpaceReady(nsid, dstSpace)
 	}
 
 	// 新流程: 获取源 space 元数据并构建完整 CREATE SPACE 语句
@@ -194,14 +189,16 @@ func createSpace(ctx context.Context, nsid, srcSpace, dstSpace string, partition
 	if err != nil {
 		return fmt.Errorf("failed to get space desc: %w", err)
 	}
-
 	// 构建 CREATE SPACE 语句
 	gql := buildCreateSpaceGql(dstSpace, desc, partitionNum, replicaFactor, vidType)
 	debugLogCtx(ctx, gql)
 	if err := executeWithGqlError(nsid, gql); err != nil {
 		return fmt.Errorf("failed to create space: %w", err)
 	}
-
+	err = waitForSpaceReady(nsid, dstSpace)
+	if err != nil {
+		return fmt.Errorf("space not ready: %w", err)
+	}
 	// 复制 tag schema
 	if err := copyTagsAdvanced(ctx, nsid, srcSpace, dstSpace); err != nil {
 		return fmt.Errorf("failed to copy tags: %w", err)
@@ -212,7 +209,8 @@ func createSpace(ctx context.Context, nsid, srcSpace, dstSpace string, partition
 		return fmt.Errorf("failed to copy edges: %w", err)
 	}
 
-	return nil
+	// wait tag/edge schema to be ready
+	return waitForEdgesAdvanced(ctx, nsid, srcSpace, dstSpace)
 }
 
 // SpaceDesc holds the metadata of a space from DESC SPACE
@@ -372,6 +370,17 @@ func copyEdgesAdvanced(ctx context.Context, nsid, srcSpace, dstSpace string) err
 		}
 	}
 
+	return nil
+}
+
+func waitForEdgesAdvanced(ctx context.Context, nsid, srcSpace, dstSpace string) error {
+	//TODO better method
+	time.Sleep(20 * time.Second)
+	return nil
+}
+
+func waitForTagsAdvanced(ctx context.Context, nsid, srcSpace, dstSpace string) error {
+	//TODO
 	return nil
 }
 
@@ -592,7 +601,7 @@ func createEdgeIndex(ctx context.Context, nsid, srcSpace, dstSpace, indexName st
 	return executeWithGqlError(nsid, execGql)
 }
 
-func copyVertices(ctx context.Context, nsid, srcSpace, dstSpace string, tags []string) error {
+func copyVertices(ctx context.Context, nsid, srcSpace, dstSpace string, tags []string, batchSize int) error {
 	for _, tag := range tags {
 		logs.Info("Copying vertices for tag: %s", tag)
 		scanner, err := NewStorageScanner(nsid, srcSpace)
@@ -602,7 +611,7 @@ func copyVertices(ctx context.Context, nsid, srcSpace, dstSpace string, tags []s
 		defer scanner.Close()
 
 		// 扫描源 space 的 vertex
-		err = scanner.ScanVertices(tag, defaultBatchSize, func(vertices []map[string]interface{}) error {
+		err = scanner.ScanVertices(tag, batchSize, func(vertices []map[string]interface{}) error {
 			logs.Info("Scanned %d vertices for tag %s", len(vertices), tag)
 			// 批量插入到目标 space
 			if err := insertVertexBatch(ctx, nsid, dstSpace, tag, vertices); err != nil {
@@ -727,7 +736,7 @@ func escapeString(s string) string {
 	return s
 }
 
-func copyEdges(ctx context.Context, nsid, srcSpace, dstSpace string, edges []string) error {
+func copyEdges(ctx context.Context, nsid, srcSpace, dstSpace string, edges []string, batchSize int) error {
 
 	for _, edge := range edges {
 		logs.Info("Copying edges for type: %s", edge)
@@ -738,7 +747,7 @@ func copyEdges(ctx context.Context, nsid, srcSpace, dstSpace string, edges []str
 		defer scanner.Close()
 
 		// 扫描源 space 的 edge
-		err = scanner.ScanEdges(edge, defaultBatchSize, func(edges []map[string]interface{}) error {
+		err = scanner.ScanEdges(edge, batchSize, func(edges []map[string]interface{}) error {
 			logs.Info("Scanned %d edges for type %s", len(edges), edge)
 			// 批量插入到目标 space
 			if err := insertEdgeBatch(ctx, nsid, dstSpace, edge, edges); err != nil {
