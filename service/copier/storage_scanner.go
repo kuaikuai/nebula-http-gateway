@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/logs"
 
 	"github.com/facebook/fbthrift/thrift/lib/go/thrift"
@@ -25,6 +26,7 @@ type StorageScanner struct {
 	partInfo       []PartitionInfo
 	sessionID      int64
 	storageClients map[string]*storage.GraphStorageServiceClient
+	hostMapping    map[string]string // 域名映射配置
 }
 
 func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
@@ -32,6 +34,7 @@ func NewStorageScanner(nsid, spaceName string) (*StorageScanner, error) {
 		nsid:           nsid,
 		spaceName:      spaceName,
 		storageClients: make(map[string]*storage.GraphStorageServiceClient, 0),
+		hostMapping:    parseStorageHostsMapping(beego.AppConfig.String("storageHostsMapping")),
 	}
 	spaceID, err := scanner.getSpaceID(spaceName)
 	if err != nil {
@@ -79,6 +82,32 @@ func (s *StorageScanner) Close() error {
 	return nil
 }
 
+// parseStorageHostsMapping 解析域名映射配置
+// 格式: domain1:ip1,domain2:ip2
+func parseStorageHostsMapping(config string) map[string]string {
+	mapping := make(map[string]string)
+	if config == "" {
+		return mapping
+	}
+	pairs := strings.Split(config, ",")
+	for _, pair := range pairs {
+		kv := strings.Split(strings.TrimSpace(pair), ":")
+		if len(kv) == 2 {
+			mapping[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		}
+	}
+	return mapping
+}
+
+// resolveHost 根据配置解析域名地址
+// 如果域名在 mapping 中存在，使用配置的值；否则返回原始域名
+func resolveHost(domain string, mapping map[string]string) string {
+	if ip, ok := mapping[domain]; ok {
+		return ip
+	}
+	return domain
+}
+
 func (s *StorageScanner) getStorageAddresses() ([]string, error) {
 	gql := fmt.Sprintf("USE %s; SHOW HOSTS STORAGE", s.spaceName)
 	result, _, err := dao.Execute(s.nsid, gql, nil)
@@ -90,7 +119,8 @@ func (s *StorageScanner) getStorageAddresses() ([]string, error) {
 	for _, row := range result.Tables {
 		if host, ok := row["Host"].(string); ok {
 			if port, ok := row["Port"].(int64); ok {
-				addrs = append(addrs, fmt.Sprintf("%s:%d", host, port))
+				resolvedHost := resolveHost(strings.Trim(host, `"'`), s.hostMapping)
+				addrs = append(addrs, fmt.Sprintf("%s:%d", resolvedHost, port))
 			}
 		}
 	}
@@ -114,7 +144,16 @@ func (s *StorageScanner) getPartitionInfo() ([]PartitionInfo, error) {
 		if partID, ok := row["Partition ID"].(int64); ok {
 			var leader string
 			if leaderVal, ok := row["Leader"]; ok {
-				leader = fmt.Sprintf("%v", leaderVal)
+				leaderStr := fmt.Sprintf("%v", leaderVal)
+				// leader 格式: "host:port"，需要解析 host 部分
+				if idx := strings.LastIndex(leaderStr, ":"); idx > 0 {
+					host := leaderStr[:idx]
+					port := leaderStr[idx+1:]
+					resolvedHost := resolveHost(strings.Trim(host, `"'`), s.hostMapping)
+					leader = resolvedHost + ":" + port
+				} else {
+					leader = leaderStr
+				}
 			}
 			parts = append(parts, PartitionInfo{
 				PartID: nebula.PartitionID(partID),
@@ -175,6 +214,14 @@ func (s *StorageScanner) getTagID(tagName string) (nebula.TagID, error) {
 						}
 					}
 				}
+				// 处理有索引的情况：IndexScan 中 schemaId 就是 tag ID
+				if strings.Contains(opName, "IndexScan") {
+					if opInfo, ok := row["operator info"].(string); ok {
+						if tagID, found := extractSchemaId(opInfo); found {
+							return nebula.TagID(tagID), nil
+						}
+					}
+				}
 			}
 		}
 		lastErr = fmt.Errorf("tag ID not found for %s, result tables:%v", tagName, result.Tables)
@@ -188,6 +235,31 @@ func (s *StorageScanner) getTagID(tagName string) (nebula.TagID, error) {
 func extractTagID(opInfo string) (int64, bool) {
 	for i := 0; i < len(opInfo)-8; i++ {
 		if strings.Contains(opInfo[i:i+7], "tagId") {
+			for j := i; j < len(opInfo); j++ {
+				if opInfo[j] == ':' {
+					j++
+					for j < len(opInfo) && (opInfo[j] == ':' || opInfo[j] == ' ' || opInfo[j] == '"') {
+						j++
+					}
+					var num int64
+					for j < len(opInfo) && opInfo[j] >= '0' && opInfo[j] <= '9' {
+						num = num*10 + int64(opInfo[j]-'0')
+						j++
+					}
+					if num > 0 {
+						return num, true
+					}
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func extractSchemaId(opInfo string) (int64, bool) {
+	// Parse "schemaId": 112 from the JSON opInfo
+	for i := 0; i < len(opInfo)-9; i++ {
+		if strings.Contains(opInfo[i:i+8], "schemaId") {
 			for j := i; j < len(opInfo); j++ {
 				if opInfo[j] == ':' {
 					j++
