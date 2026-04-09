@@ -461,7 +461,7 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 
 			resp, err := client.ScanVertex(req)
 			if err != nil {
-				if isTimeoutError(err) && len(batch) > 0 {
+				if isRetryableError(err) && len(batch) > 0 {
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
@@ -639,7 +639,7 @@ func (s *StorageScanner) ScanEdges(edgeName string, batchSize int, handler func(
 
 			resp, err := client.ScanEdge(req)
 			if err != nil {
-				if isTimeoutError(err) && len(batch) > 0 {
+				if isRetryableError(err) && len(batch) > 0 {
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
@@ -761,13 +761,15 @@ func (s *StorageScanner) valueToInterface(val *nebula.Value) interface{} {
 	return nil
 }
 
-func isTimeoutError(err error) bool {
+func isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "timeout") ||
 		strings.Contains(errStr, "deadline") ||
+		strings.Contains(errStr, "unknown column") ||
+		strings.Contains(errStr, "unknown edge")
 		strings.Contains(errStr, "i/o timeout")
 }
 

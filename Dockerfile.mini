@@ -1,0 +1,35 @@
+# Stage 1: Build
+FROM golang:1.13-alpine AS builder
+
+WORKDIR /build
+
+# Copy go mod files first for better layer caching
+COPY go.mod go.sum ./
+COPY ccore/go.mod ccore/go.sum ./ccore/
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o nebula-httpd .
+
+# Stage 2: Minimal runtime image
+FROM alpine:3.14
+
+# Install ca-certificates for HTTPS and timezone data
+RUN apk --no-cache add ca-certificates tzdata
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /build/nebula-httpd .
+
+# Copy configuration
+COPY --from=builder /build/conf ./conf
+
+EXPOSE 8080
+
+ENTRYPOINT ["./nebula-httpd"]
