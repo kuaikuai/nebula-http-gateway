@@ -16,6 +16,11 @@ const (
 	retryInterval = 5 * time.Second
 )
 
+const (
+	maxVerifyRetries    = 3
+	verifyRetrySleepSec = 3
+)
+
 var defaultBatchSize = beego.AppConfig.DefaultInt("copyBatchSize", 1000)
 
 type contextKey string
@@ -47,8 +52,8 @@ func executeWithRetry(nsid, gql string) (interface{}, interface{}, error) {
 			return result, warn, nil
 		}
 
-		// 仅超时错误重试
-		if !isTimeoutError(err) {
+		// 仅超时错误重试或者属性元数据没有同步过来等待一下
+		if !isRetryableError(err) {
 			return result, warn, err
 		}
 
@@ -461,8 +466,18 @@ func copyFulltextIndexes(ctx context.Context, nsid, srcSpace, dstSpace string) e
 			continue
 		}
 
-		// 在索引名后加上 space ID 避免冲突
-		newIndexName := fmt.Sprintf("%s_%d", indexName, dstSpaceID)
+		// 生成新索引名：只有 text_idx_xxx 或 knn_idx_xxx 格式才替换 space_name；否则加上 space ID
+		var newIndexName string
+		lowerIndexName := strings.ToLower(indexName)
+		lowerSrcSpace := strings.ToLower(srcSpace)
+		if (strings.HasPrefix(lowerIndexName, "text_idx_") || strings.HasPrefix(lowerIndexName, "knn_idx_")) &&
+			strings.Contains(lowerIndexName, lowerSrcSpace) {
+			// 替换 space_name 部分
+			newIndexName = strings.Replace(indexName, srcSpace, dstSpace, 1)
+		} else {
+			// 原规则：在索引名后加上 space ID 避免冲突
+			newIndexName = fmt.Sprintf("%s_%d", indexName, dstSpaceID)
+		}
 
 		// 4. 生成 CREATE FULLTEXT INDEX nGQL
 		var createGql string
@@ -536,20 +551,77 @@ func copyListeners(ctx context.Context, nsid, srcSpace, dstSpace string) (bool, 
 	return true, nil
 }
 
-func createIndexes(ctx context.Context, nsid, srcSpace, dstSpace string) error {
-	tagIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW TAG INDEXES", srcSpace), nil)
-	edgeIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW EDGE INDEXES", srcSpace), nil)
+// verifyIndex verifies that an index was created successfully by running REBUILD command.
+// If SemanticError: Index is returned, it retries after sleeping (for async metadata sync).
+func verifyIndex(nsid, spaceName, indexType, indexName string) error {
+	gql := fmt.Sprintf("USE %s; REBUILD %s INDEX %s", spaceName, indexType, indexName)
+	var lastErr error
+	for i := 0; i < maxVerifyRetries; i++ {
+		_, _, err := dao.Execute(nsid, gql, nil)
+		if err == nil {
+			return nil
+		}
+		// Check if it's a SemanticError related to index not ready yet
+		if strings.Contains(err.Error(), "SemanticError") && strings.Contains(err.Error(), "Index") {
+			lastErr = err
+			logs.Warn("[VERIFY RETRY] SemanticError for index %s, retrying %d/%d after %d seconds",
+				indexName, i+1, maxVerifyRetries, verifyRetrySleepSec)
+			time.Sleep(time.Duration(verifyRetrySleepSec) * time.Second)
+			continue
+		}
+		// Other errors - return immediately
+		return fmt.Errorf("verify index %s failed: %w", indexName, err)
+	}
+	return fmt.Errorf("verify index %s failed after %d retries: %w", indexName, maxVerifyRetries, lastErr)
+}
 
+func createIndexes(ctx context.Context, nsid, srcSpace, dstSpace string) error {
+	// Phase 1: Get all tag index names
+	tagIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW TAG INDEXES", srcSpace), nil)
+	var tagIndexNames []string
 	for _, row := range tagIndexResult.Tables {
 		if indexName, ok := row["Index Name"].(string); ok {
-			createTagIndex(ctx, nsid, srcSpace, dstSpace, indexName)
+			tagIndexNames = append(tagIndexNames, indexName)
 		}
 	}
+
+	// Phase 2: Get all edge index names
+	edgeIndexResult, _, _ := dao.Execute(nsid, fmt.Sprintf("USE %s; SHOW EDGE INDEXES", srcSpace), nil)
+	var edgeIndexNames []string
 	for _, row := range edgeIndexResult.Tables {
 		if indexName, ok := row["Index Name"].(string); ok {
-			createEdgeIndex(ctx, nsid, srcSpace, dstSpace, indexName)
+			edgeIndexNames = append(edgeIndexNames, indexName)
 		}
 	}
+
+	// Phase 3: Batch create all Tag indexes
+	for _, indexName := range tagIndexNames {
+		if err := createTagIndex(ctx, nsid, srcSpace, dstSpace, indexName); err != nil {
+			return fmt.Errorf("create tag index %s failed: %w", indexName, err)
+		}
+	}
+
+	// Phase 4: Batch create all Edge indexes
+	for _, indexName := range edgeIndexNames {
+		if err := createEdgeIndex(ctx, nsid, srcSpace, dstSpace, indexName); err != nil {
+			return fmt.Errorf("create edge index %s failed: %w", indexName, err)
+		}
+	}
+
+	// Phase 5: Unified verify all Tag indexes
+	for _, indexName := range tagIndexNames {
+		if err := verifyIndex(nsid, dstSpace, "TAG", indexName); err != nil {
+			return fmt.Errorf("verify tag index %s failed: %w", indexName, err)
+		}
+	}
+
+	// Phase 6: Unified verify all Edge indexes
+	for _, indexName := range edgeIndexNames {
+		if err := verifyIndex(nsid, dstSpace, "EDGE", indexName); err != nil {
+			return fmt.Errorf("verify edge index %s failed: %w", indexName, err)
+		}
+	}
+
 	return nil
 }
 
