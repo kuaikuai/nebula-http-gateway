@@ -518,7 +518,7 @@ func (s *StorageScanner) ScanVertices(tagName string, batchSize int, handler fun
 
 				// Add properties, skipping _vid/vid column
 				for i, colName := range columnNames {
-					colStr := strings.ToLower(string(colName))
+					colStr := string(colName)
 					if colStr == "_vid" || colStr == "vid" {
 						continue
 					}
@@ -769,7 +769,7 @@ func isRetryableError(err error) bool {
 	return strings.Contains(errStr, "timeout") ||
 		strings.Contains(errStr, "deadline") ||
 		strings.Contains(errStr, "unknown column") ||
-		strings.Contains(errStr, "unknown edge")
+		strings.Contains(errStr, "unknown edge") ||
 		strings.Contains(errStr, "i/o timeout")
 }
 

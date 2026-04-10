@@ -17,7 +17,7 @@ const (
 )
 
 const (
-	maxVerifyRetries    = 3
+	maxVerifyRetries    = 10
 	verifyRetrySleepSec = 3
 )
 
@@ -597,14 +597,18 @@ func createIndexes(ctx context.Context, nsid, srcSpace, dstSpace string) error {
 	// Phase 3: Batch create all Tag indexes
 	for _, indexName := range tagIndexNames {
 		if err := createTagIndex(ctx, nsid, srcSpace, dstSpace, indexName); err != nil {
-			return fmt.Errorf("create tag index %s failed: %w", indexName, err)
+			if !strings.Contains(err.Error(), "Existed") {
+				return fmt.Errorf("create tag index %s failed: %w", indexName, err)
+			}
 		}
 	}
 
 	// Phase 4: Batch create all Edge indexes
 	for _, indexName := range edgeIndexNames {
 		if err := createEdgeIndex(ctx, nsid, srcSpace, dstSpace, indexName); err != nil {
-			return fmt.Errorf("create edge index %s failed: %w", indexName, err)
+			if !strings.Contains(err.Error(), "Existed") {
+				return fmt.Errorf("create edge index %s failed: %w", indexName, err)
+			}
 		}
 	}
 
